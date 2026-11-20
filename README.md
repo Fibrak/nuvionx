@@ -1,4 +1,8 @@
-# NuvioNX
+<p align="center">
+  <img src="icon.jpg" alt="NuvioNX" width="128" />
+</p>
+
+<h1 align="center">NuvioNX</h1>
 
 An unofficial, native **Nintendo Switch** homebrew port of
 [NuvioTV](https://github.com/NuvioMedia/NuvioTV), released under **GPL-3.0** like the original.
