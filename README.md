@@ -70,6 +70,56 @@ In handheld mode you can tap items, swipe to scroll, and tap the on-screen hint 
 
 ---
 
+## Accounts & importing your setup
+
+All of these are optional. API keys/URLs are **not** bundled — you supply your own. The easiest way
+to enter long values is from a phone/PC browser: with NuvioNX open, go to `http://<switch-ip>:8080`
+(addons) or `http://<switch-ip>:8080/account` (Nuvio + Trakt), which saves straight to the Switch.
+
+### Import from Nuvio for Windows
+
+If you already use the official **Nuvio for Windows** app, you can copy your setup over in one step:
+addons (order + enabled state), library + Trakt watchlist, watch progress and watched history.
+
+1. On the PC with Nuvio installed, open `tools/switchip.txt` and put your Switch's IP on the last
+   line (the Addons tab shows it as `http://<ip>:8080`).
+2. Open NuvioNX on the Switch (same Wi-Fi) and double-click **`tools/import-to-my-switch.cmd`**.
+
+Re-running never creates duplicates. Full details and the Wi-Fi-less (SD card) method are in
+[`tools/README.md`](tools/README.md).
+
+### Connect a Nuvio account
+
+Pulls your addons, debrid keys, library and watch progress from your Nuvio account.
+
+1. **Account** tab → **Use official Nuvio server** (sets the Nuvio API URL), then paste your Nuvio
+   **publishable key** when prompted. The key is published in Nuvio's own API docs; it isn't bundled
+   here. (Or enter a self-hosted server URL + key instead.)
+2. Choose **Sign in with code** → a QR code and a short code appear.
+3. Scan the QR with your phone, or open **nuvio.tv/link** and enter the code, then approve.
+
+It signs in and imports automatically, and re-syncs on every launch (plus a **Sync now** button).
+Sync is pull-only — watching on the Switch doesn't push back to the Nuvio account.
+
+### Connect Trakt
+
+Pulls your Trakt progress, watched history and watchlist, and **scrobbles** what you watch
+(start/pause/stop; Trakt marks things watched past ~80%).
+
+1. Create a free Trakt API app at **<https://trakt.tv/oauth/applications/new>**:
+   - **Redirect uri:** `urn:ietf:wg:oauth:2.0:oob`
+   - Save, then copy the **Client ID**. A Client Secret is **not needed** for newer (PKCE) apps —
+     NuvioNX signs in with the Client ID alone.
+2. On the Switch: **Account** tab → press **Right** to the Trakt column → **Enter Client ID**
+   (or paste it at `:8080/account`).
+3. Choose **Connect Trakt** → scan the QR, or open **trakt.tv/activate** and enter the code, then
+   approve.
+
+> Trakt ties each sign-in to the app that created it, so a login from NuvioTV can't be reused — you
+> connect once with your own Trakt app as above. It reaches the same Trakt account and data.
+
+---
+
 ## Build from source
 
 You need **devkitPro** (devkitA64 + libnx) and a few portlibs. On Windows this was built with
