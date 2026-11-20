@@ -3,6 +3,7 @@
 
 #include "input.hpp"
 #include "screens.hpp"
+#include "store.hpp"
 
 using namespace gfx;
 
@@ -18,6 +19,17 @@ public:
     }
 
     void update(float dt) override {
+        // Debug: ZL+ZR cycles  off -> overlay -> overlay+flat cards -> off.
+        if ((input::held(input::ZL) && input::pressed(input::ZR)) ||
+            (input::held(input::ZR) && input::pressed(input::ZL))) {
+            dbgMode_ = (dbgMode_ + 1) % 3;
+            auto& s = store::settings();
+            s.perfOverlay = dbgMode_ > 0;
+            gfx::setDebugFlat(dbgMode_ == 2);
+            store::saveSettings();
+            const char* msg[] = {"Debug OFF", "Overlay ON", "Overlay + FLAT cards (no rounded corners)"};
+            App::get().toast(msg[dbgMode_]);
+        }
         if (input::pressed(input::Plus)) {
             App::get().requestQuit();
             return;
@@ -131,6 +143,7 @@ private:
     std::vector<std::shared_ptr<Page>> pages_;
     std::vector<std::string> names_;
     int tab_ = 0;
+    int dbgMode_ = 0;
     bool onTabs_ = false;
 };
 

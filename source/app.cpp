@@ -81,10 +81,10 @@ bool App::init() {
     int pw = 1920, ph = 1080;
     SDL_GetRendererOutputSize(renderer_, &pw, &ph);
     if (!plUp_ || !gfx::init(renderer_, pw, ph)) return false;
-    // Artwork cache: generous on a full-memory (game-override) launch so scrolling the
-    // whole home screen never evicts posters you'll scroll back to; small in applet mode.
+    // Artwork cache budget: modest. (Eviction isn't what caused scroll flicker - that was
+    // the rounded-corner drawing - so a big cache is pointless and just starves playback.)
     {
-        size_t mb = (size_t)std::max(96, std::min(512, memoryMB_ / 5));
+        size_t mb = (size_t)std::max(64, std::min(160, memoryMB_ / 16));
         gfx::setImageBudget(mb * 1024 * 1024);
     }
 
@@ -182,6 +182,7 @@ void App::run() {
         for (size_t i = first; i < stack_.size(); i++) stack_[i]->render();
         drawToasts();
 
+        if (store::settings().perfOverlay) drawPerfOverlay(dt);
         SDL_RenderPresent(renderer_);
         gfx::endFrame();
     }
@@ -232,6 +233,47 @@ void App::replaceTop(std::shared_ptr<Screen> s) {
 void App::toast(const std::string& msg) {
     toasts_.push_back({msg, gfx::now() + 2.8});
     if (toasts_.size() > 3) toasts_.erase(toasts_.begin());
+}
+
+void App::drawPerfOverlay(float dt) {
+    using namespace gfx;
+    // smoothed fps + worst frame time over a window
+    static double acc = 0, worst = 0;
+    static int frames = 0;
+    static double fps = 0, shownWorst = 0;
+    acc += dt;
+    worst = std::max(worst, (double)dt);
+    frames++;
+    if (acc >= 0.3) {
+        fps = frames / acc;
+        shownWorst = worst;
+        acc = 0;
+        worst = 0;
+        frames = 0;
+    }
+    int ready = 0, total = 0, pending = 0, up = 0, miss = 0, evicts = 0;
+    double mb = 0;
+    gfx::imageStats(ready, total, mb, pending, up);
+    gfx::imageStats2(miss, evicts);
+    static int lastEvicts = 0, evictPerSec = 0;
+    static double evAcc = 0;
+    evAcc += dt;
+    if (evAcc >= 1.0) {
+        evictPerSec = evicts - lastEvicts;
+        lastEvicts = evicts;
+        evAcc = 0;
+    }
+    char l1[96], l2[96], l3[96];
+    snprintf(l1, sizeof l1, "%.0f fps   frame %.1f ms (worst %.0f)", fps, dt * 1000, shownWorst * 1000);
+    snprintf(l2, sizeof l2, "img ready %d/%d  %.0f MB  pending %d  up/f %d", ready, total, mb, pending, up);
+    snprintf(l3, sizeof l3, "MISS/f %d   evict/s %d", miss, evictPerSec);
+    float w = 430, x = W - w - 12, y = 70;
+    fillRect(x, y, w, 72, Col{0, 0, 0, 205});
+    Col c = (fps < 55) ? rgba(0xEF4444) : rgba(0x6EE7B7);
+    text(l1, x + 10, y + 6, 15, c, true);
+    text(l2, x + 10, y + 27, 14, Col{255, 255, 255, 230});
+    Col mc = (miss > 0 || evictPerSec > 0) ? rgba(0xFCD34D) : Col{255, 255, 255, 200};
+    text(l3, x + 10, y + 48, 14, mc, true);
 }
 
 void App::drawToasts() {

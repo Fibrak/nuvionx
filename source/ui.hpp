@@ -88,10 +88,14 @@ private:
     bool visible(size_t i) const;
     float rowHeight(const PosterRow& r) const;
     float vscroll_ = 0, vtarget_ = 0;
+    float focusAmt_ = 1.f;        // eased focus highlight (0 just after focus jumps)
+    int focusRow_ = -1, focusCol_ = -1;
 };
 
 void cardSize(bool landscape, float& w, float& h);
+// focusAmt (0..1) eases the focus scale + ring in, so a card the cursor only
+// crosses for a frame during fast scrolling barely changes (no pop/flicker).
 void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h, bool focused, bool landscape,
-              bool showTitle);
+              bool showTitle, float focusAmt = 1.f);
 
 }  // namespace ui

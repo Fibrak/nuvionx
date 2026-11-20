@@ -285,19 +285,43 @@ void fillRect(float x, float y, float w, float h, Col c) {
     SDL_RenderFillRectF(R, &rc);
 }
 
+// Rounded rect as a 9-slice: the centre and four edges are axis-aligned quads (drawn
+// exactly like a plain textured quad, so they don't shimmer during motion), and only
+// the four small corners are triangle fans. The old version fanned the WHOLE rect from
+// its centre, whose many diagonal internal edges shimmered while scrolling.
 static void texturedPoly(SDL_Texture* t, float x, float y, float w, float h, float r, Col c, float u0, float v0,
                          float uw, float vh) {
-    static std::vector<SDL_FPoint> pts;
-    roundPoly(x, y, w, h, r, pts);
+    r = std::max(0.f, std::min(r, std::min(w, h) / 2));
     g_verts.clear();
     g_idx.clear();
-    g_verts.push_back(vtx(x + w / 2, y + h / 2, c, u0 + uw / 2, v0 + vh / 2));
-    for (auto& p : pts) g_verts.push_back(vtx(p.x, p.y, c, u0 + (p.x - x) / w * uw, v0 + (p.y - y) / h * vh));
-    int n = (int)pts.size();
-    for (int i = 0; i < n; i++) {
-        g_idx.push_back(0);
-        g_idx.push_back(1 + i);
-        g_idx.push_back(1 + (i + 1) % n);
+    auto V = [&](float px, float py) -> int {
+        g_verts.push_back(vtx(px, py, c, u0 + (px - x) / w * uw, v0 + (py - y) / h * vh));
+        return (int)g_verts.size() - 1;
+    };
+    auto quad = [&](float x0, float y0, float x1, float y1) {
+        int a = V(x0, y0), b = V(x1, y0), cc = V(x1, y1), d = V(x0, y1);
+        g_idx.insert(g_idx.end(), {a, b, cc, a, cc, d});
+    };
+    quad(x + r, y + r, x + w - r, y + h - r);  // centre
+    quad(x + r, y, x + w - r, y + r);          // top edge
+    quad(x + r, y + h - r, x + w - r, y + h);  // bottom edge
+    quad(x, y + r, x + r, y + h - r);          // left edge
+    quad(x + w - r, y + r, x + w, y + h - r);  // right edge
+    if (r > 0.5f) {
+        const int seg = 6;
+        struct Corner {
+            float cx, cy, a0;
+        } cs[4] = {{x + r, y + r, 180.f}, {x + w - r, y + r, 270.f}, {x + w - r, y + h - r, 0.f}, {x + r, y + h - r, 90.f}};
+        for (auto& k : cs) {
+            int center = V(k.cx, k.cy);
+            int prev = -1;
+            for (int i = 0; i <= seg; i++) {
+                float a = (k.a0 + 90.f * i / seg) * (float)M_PI / 180.f;
+                int p = V(k.cx + r * cosf(a), k.cy + r * sinf(a));
+                if (prev >= 0) g_idx.insert(g_idx.end(), {center, prev, p});
+                prev = p;
+            }
+        }
     }
     SDL_RenderGeometry(R, t, g_verts.data(), (int)g_verts.size(), g_idx.data(), (int)g_idx.size());
 }
@@ -306,6 +330,37 @@ void roundRect(float x, float y, float w, float h, float rad, Col c) {
     if (c.a == 0 || w <= 0 || h <= 0) return;
     if (rad <= 0.5f) return fillRect(x, y, w, h, c);
     texturedPoly(nullptr, x, y, w, h, rad, c, 0, 0, 1, 1);
+}
+
+void cornerCutouts(float x, float y, float w, float h, float r, Col col) {
+    if (col.a == 0) return;
+    r = std::max(0.f, std::min(r, std::min(w, h) / 2));
+    if (r <= 0.5f) return;
+    g_verts.clear();
+    g_idx.clear();
+    auto V = [&](float px, float py) -> int {
+        g_verts.push_back(vtx(px, py, col));
+        return (int)g_verts.size() - 1;
+    };
+    // outer square corner + arc centre + start angle for each corner
+    struct Corner {
+        float ox, oy, cx, cy, a0;
+    } cs[4] = {{x, y, x + r, y + r, 180.f},
+               {x + w, y, x + w - r, y + r, 270.f},
+               {x + w, y + h, x + w - r, y + h - r, 0.f},
+               {x, y + h, x + r, y + h - r, 90.f}};
+    const int seg = 6;
+    for (auto& k : cs) {
+        int o = V(k.ox, k.oy);
+        int prev = -1;
+        for (int i = 0; i <= seg; i++) {
+            float a = (k.a0 + 90.f * i / seg) * (float)M_PI / 180.f;
+            int p = V(k.cx + r * cosf(a), k.cy + r * sinf(a));
+            if (prev >= 0) g_idx.insert(g_idx.end(), {o, prev, p});
+            prev = p;
+        }
+    }
+    SDL_RenderGeometry(R, nullptr, g_verts.data(), (int)g_verts.size(), g_idx.data(), (int)g_idx.size());
 }
 
 void roundOutline(float x, float y, float w, float h, float rad, float thick, Col c) {
@@ -532,6 +587,49 @@ static void imageWorker() {
 }
 
 static int g_uploadsThisFrame = 0;
+static int g_uploadsLastFrame = 0;
+static int g_missThisFrame = 0;   // cards that fell back to placeholder (image() returned null)
+static int g_missLastFrame = 0;
+static int g_evictTotal = 0;      // cumulative evictions (overlay shows the rate)
+
+void imageStats(int& ready, int& total, double& megabytes, int& pending, int& uploadsLastFrame) {
+    std::lock_guard<std::mutex> lk(g_imgMutex);
+    ready = 0;
+    pending = 0;
+    size_t bytes = 0;
+    total = (int)g_imgs.size();
+    for (auto& kv : g_imgs) {
+        if (kv.second.st == Ready) {
+            ready++;
+            bytes += kv.second.bytes;
+        } else if (kv.second.st != Failed) {
+            pending++;
+        }
+    }
+    megabytes = bytes / 1048576.0;
+    uploadsLastFrame = g_uploadsLastFrame;
+}
+
+static bool g_debugFlat = false;
+void setDebugFlat(bool on) { g_debugFlat = on; }
+bool debugFlat() { return g_debugFlat; }
+
+void imageStats2(int& missLastFrame, int& evictTotal) {
+    std::lock_guard<std::mutex> lk(g_imgMutex);
+    missLastFrame = g_missLastFrame;
+    evictTotal = g_evictTotal;
+}
+
+void releaseImageCache() {
+    std::lock_guard<std::mutex> lk(g_imgMutex);
+    for (auto& kv : g_imgs) {
+        if (kv.second.tex) SDL_DestroyTexture(kv.second.tex);
+        if (kv.second.surf) SDL_FreeSurface(kv.second.surf);
+    }
+    g_imgs.clear();
+    g_imgStack.clear();
+    // keep g_shownOnce so reloaded images appear instantly rather than re-fading
+}
 
 SDL_Texture* image(const std::string& url, int maxW, int maxH) {
     if (url.empty() || (url.compare(0, 4, "http") != 0)) return nullptr;
@@ -554,6 +652,7 @@ SDL_Texture* image(const std::string& url, int maxW, int maxH) {
             if (o != g_imgs.end() && o->second.st == Queued && now() - o->second.lastUse > 2.0) g_imgs.erase(o);
         }
         g_imgCv.notify_one();
+        g_missThisFrame++;
         return nullptr;
     }
     Img& im = it->second;
@@ -590,6 +689,7 @@ SDL_Texture* image(const std::string& url, int maxW, int maxH) {
             im.st = Failed;
         }
     }
+    if (im.st != Ready) g_missThisFrame++;
     return im.st == Ready ? im.tex : nullptr;
 }
 
@@ -671,6 +771,7 @@ static void gcImages() {
         if (it == g_imgs.end()) continue;
         bytes -= it->second.bytes;
         ready--;
+        g_evictTotal++;
         SDL_DestroyTexture(it->second.tex);
         g_imgs.erase(it);
     }
@@ -734,7 +835,10 @@ void shutdown() {
 
 void beginFrame() {
     g_now = (double)(SDL_GetPerformanceCounter() - g_start) / (double)g_freq;
+    g_uploadsLastFrame = g_uploadsThisFrame;
     g_uploadsThisFrame = 0;
+    g_missLastFrame = g_missThisFrame;
+    g_missThisFrame = 0;
     const Theme& t = theme();
     SDL_SetRenderDrawColor(R, t.bg.r, t.bg.g, t.bg.b, 255);
     SDL_RenderClear(R);

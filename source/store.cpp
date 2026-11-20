@@ -68,6 +68,7 @@ void load() {
         g_settings.lanServer = v["lanServer"].boolean(true);
         g_settings.diskImageCache = v["diskImageCache"].boolean(false);
         g_settings.cpuBoost = v["cpuBoost"].boolean(false);
+        g_settings.perfOverlay = v["perfOverlay"].boolean(false);
         g_settings.realDebridKey = v["realDebridKey"].str();
         g_settings.torboxKey = v["torboxKey"].str();
         g_settings.premiumizeKey = v["premiumizeKey"].str();
@@ -135,6 +136,7 @@ void saveSettings() {
     o.set("lanServer", g_settings.lanServer);
     o.set("diskImageCache", g_settings.diskImageCache);
     o.set("cpuBoost", g_settings.cpuBoost);
+    o.set("perfOverlay", g_settings.perfOverlay);
     o.set("realDebridKey", g_settings.realDebridKey);
     o.set("torboxKey", g_settings.torboxKey);
     o.set("premiumizeKey", g_settings.premiumizeKey);

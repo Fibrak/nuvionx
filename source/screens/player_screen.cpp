@@ -177,6 +177,9 @@ private:
 
     void start() {
         const store::Settings& st = store::settings();
+        // Free cached artwork so mpv/FFmpeg get the RAM (biggest single win for playback
+        // stability). Posters reload instantly when you return to browsing.
+        gfx::releaseImageCache();
         mpv_ = mpv_create();
         if (!mpv_) {
             error_ = "Could not create the mpv player instance.";
@@ -212,10 +215,12 @@ private:
         mpv_set_option_string(mpv_, "framedrop", "decoder+vo");
         mpv_set_option_string(mpv_, "cache", "yes");
         mpv_set_option_string(mpv_, "cache-on-disk", "no");  // buffer in RAM only, never on the SD card
-        // size the network buffer to the memory this launch actually has
+        // Network buffer: keep it bounded and modest so RAM doesn't creep up over a long
+        // movie. A few seconds of forward buffer is plenty for a direct HTTP(S) stream.
         bool bigMemory = App::get().memoryBudgetMB() >= 1500;
-        mpv_set_option_string(mpv_, "demuxer-max-bytes", bigMemory ? "96MiB" : "32MiB");
-        mpv_set_option_string(mpv_, "demuxer-max-back-bytes", bigMemory ? "16MiB" : "4MiB");
+        mpv_set_option_string(mpv_, "demuxer-max-bytes", bigMemory ? "48MiB" : "24MiB");
+        mpv_set_option_string(mpv_, "demuxer-max-back-bytes", bigMemory ? "16MiB" : "8MiB");
+        mpv_set_option_string(mpv_, "demuxer-readahead-secs", "20");
         mpv_set_option_string(mpv_, "network-timeout", "30");
         mpv_set_option_string(mpv_, "user-agent", "Mozilla/5.0 (Nintendo Switch) NuvioNX/0.1");
         mpv_set_option_string(mpv_, "keep-open", "no");
@@ -291,7 +296,9 @@ private:
             mpv_set_property_string(mpv_, "start", buf);
         }
         openLog();
-        mpv_request_log_messages(mpv_, "v");
+        // Warnings/errors only. Verbose logging during playback is heavy churn and
+        // floods the diag buffer; it isn't needed once things work.
+        mpv_request_log_messages(mpv_, "warn");
         log("NuvioNX: memory available " + std::to_string(App::get().memoryBudgetMB()) + " MB, applet type " +
             std::to_string((int)appletGetAppletType()));
         log("NuvioNX: playing " + std::string(relayed ? "(via local HTTPS relay) " : "") + redact(stream_.url) +

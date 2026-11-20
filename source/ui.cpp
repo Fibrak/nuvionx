@@ -221,10 +221,10 @@ void cardSize(bool landscape, float& w, float& h) {
 }
 
 void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h, bool focused, bool landscape,
-              bool showTitle) {
+              bool showTitle, float focusAmt) {
     const Theme& t = theme();
     if (focused) {
-        float g = 1.05f;
+        float g = 1.f + 0.05f * focusAmt;  // eased scale, not an instant 1.05 pop
         float nw = w * g, nh = h * g;
         x -= (nw - w) / 2;
         y -= (nh - h) / 2;
@@ -233,6 +233,7 @@ void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h,
     }
     std::string url = landscape ? (m.background.empty() ? m.poster : m.background) : m.poster;
     SDL_Texture* tex = image(url, landscape ? 480 : 300, landscape ? 270 : 450);
+    float rad = debugFlat() ? 0.f : 10.f;  // debug: flat (plain copy) vs rounded (geometry)
     float fade = tex ? imageFade(url) : 0.f;
     if (fade < 1.f) {
         // placeholder (stays underneath while the artwork fades in)
@@ -246,12 +247,20 @@ void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h,
             }
         }
     }
-    if (tex) drawCover(tex, x, y, w, h, 10, (Uint8)(255 * fade));
+    if (tex) {
+        // Crisp square blit (flat RenderCopy path - no shimmer), then round the corners
+        // with solid-colour cut-outs matching the background behind the card.
+        drawCover(tex, x, y, w, h, 0, (Uint8)(255 * fade));
+        if (rad > 0.5f) cornerCutouts(x, y, w, h, rad, t.bg);
+    }
     if (landscape && m.progress >= 0) {
         fillRect(x + 10, y + h - 12, w - 20, 4, withA(t.text, 70));
         fillRect(x + 10, y + h - 12, (w - 20) * std::min(1.f, m.progress), 4, t.accent);
     }
-    if (focused) focusRing(x, y, w, h, 10);
+    if (focused && focusAmt > 0.01f) {
+        Col ring = withA(t.focusRing, (Uint8)(255 * std::min(1.f, focusAmt)));
+        roundOutline(x - 4, y - 4, w + 8, h + 8, 14, 3, ring);
+    }
     if (landscape) {
         text(m.name, x + 2, y + h + 8, 16, focused ? t.text : t.text2, true, Left, w);
         if (!m.subtitle.empty()) text(m.subtitle, x + 2, y + h + 28, 14, t.text3, false, Left, w);
@@ -363,6 +372,15 @@ bool RowsView::handleNav(bool* hitTop) {
 
 void RowsView::update(float dt) {
     ensureValidFocus();
+    // Ease the focus highlight in. When focus jumps (fast scroll), reset to 0 so cards the
+    // cursor only crosses for a frame barely scale — kills the pop/flicker.
+    int curCol = (visible(row) && !rows[row].items.empty()) ? rows[row].col : 0;
+    if (row != focusRow_ || curCol != focusCol_) {
+        focusAmt_ = 0.f;
+        focusRow_ = row;
+        focusCol_ = curCol;
+    }
+    focusAmt_ = approach(focusAmt_, 1.f, dt, 13);
     float acc = 0;
     for (int i = 0; i < (int)rows.size() && i < row; i++)
         if (visible(i)) acc += rowHeight(rows[i]);
@@ -439,7 +457,7 @@ void RowsView::render(float top, float bottom) {
             }
             if (rowFocused && r.col < (int)r.items.size()) {
                 float cx = kLeft + r.col * (cw + kGap) - r.scroll;
-                drawCard(r.items[r.col], cx, cy, cw, ch, true, r.landscape, showTitles);
+                drawCard(r.items[r.col], cx, cy, cw, ch, true, r.landscape, showTitles, focusAmt_);
             }
             if (r.paging) {
                 float cx = kLeft + r.items.size() * (cw + kGap) - r.scroll;

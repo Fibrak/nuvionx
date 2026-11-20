@@ -68,10 +68,23 @@ SDL_Texture* image(const std::string& url, int maxW = 600, int maxH = 900);
 bool imageFailed(const std::string& url);
 // Upper bound for decoded artwork kept in GPU memory.
 void setImageBudget(size_t bytes);
+// Free all cached artwork textures (e.g. before video playback, to give mpv the RAM).
+// Images reload on next use; already-seen ones reappear instantly (no fade).
+void releaseImageCache();
 // 0..1 ramp since the image became ready (for fade-in; 0 if not ready).
 float imageFade(const std::string& url, float duration = 0.18f);
+// Diagnostics: cache contents and how many textures were uploaded last frame.
+void imageStats(int& ready, int& total, double& megabytes, int& pending, int& uploadsLastFrame);
+void imageStats2(int& missLastFrame, int& evictTotal);
+// Debug: draw cards as plain textured quads (no rounded-corner geometry) to bisect flicker.
+void setDebugFlat(bool on);
+bool debugFlat();
 // Draw texture to cover (crop) the rect, with rounded corners.
 void drawCover(SDL_Texture* t, float x, float y, float w, float h, float rad = 0, Uint8 alpha = 255);
+// Fill the four corner cut-outs (square corner minus the rounded arc) with a solid
+// colour. Used to round a crisply-blitted image without textured geometry (which
+// shimmers during motion on the Switch). `col` should match what's behind the card.
+void cornerCutouts(float x, float y, float w, float h, float rad, Col col);
 // Draw texture fitted (letterboxed) inside the rect, aligned left/center.
 void drawFit(SDL_Texture* t, float x, float y, float w, float h, Uint8 alpha = 255, Align al = Left);
 

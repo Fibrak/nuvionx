@@ -101,6 +101,7 @@ private:
     void refreshManifest(const std::string& manifestUrl);
     void syncEntries();
     void drawToasts();
+    void drawPerfOverlay(float dt);
 
     SDL_Window* window_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;

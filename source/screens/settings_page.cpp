@@ -121,7 +121,7 @@ private:
             case 11: return "TorBox API key";
             case 12: return "Premiumize API key";
             case 13: return "Clear watch history";
-            default: return "NuvioNX 0.1.0  -  unofficial Switch port of NuvioTV (GPL-3.0)";
+            default: return "NuvioNX 0.1.1  -  unofficial Switch port of NuvioTV (GPL-3.0)";
         }
     }
 
