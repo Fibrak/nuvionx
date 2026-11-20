@@ -1,0 +1,4 @@
+# Put your Switch's IP address on the line below (no http://, no port).
+# NuvioNX shows it in the Addons tab as http://<ip>:8080
+# Example:
+192.168.1.100
