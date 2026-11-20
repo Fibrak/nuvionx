@@ -24,3 +24,6 @@ nuvio-import*.json
 *.swp
 .DS_Store
 Thumbs.db
+
+# Release packages
+*.zip
