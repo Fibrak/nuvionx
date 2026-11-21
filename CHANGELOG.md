@@ -4,14 +4,22 @@ All notable changes to NuvioNX are documented here.
 
 ## [0.1.4] - 2026-11-21
 
+### Changed
+- **Smooth, judder-free 1080p playback.** Reworked the video renderer to run mpv's
+  frame conversion on the main vsync-paced thread instead of a background thread, so
+  `render` and the vblank report (`report_swap`) are on one thread as mpv requires.
+  That lets `video-sync=display-resample` pace every frame to a whole number of 60 Hz
+  refreshes (clean 3:2 for 24p, even 30p) with no cross-thread timing jitter. The
+  display rate is pinned to the panel's 60 Hz and interpolation stays off.
+
 ### Fixed
-- **Hard crash (data abort / kernel panic) after a while during playback.** The
-  0.1.2/0.1.3 attempt at smoother video called `mpv_render_context_report_swap()`
-  from the main thread while `mpv_render_context_render()` ran on the background
-  render thread. mpv requires both on the same thread; the race corrupted mpv's
-  display-sync state and then the heap, crashing later inside libc's number/locale
-  formatting code. Reverted to mpv's default audio sync (the pre-0.1.2 behaviour).
-  Smoothness tuning will be revisited in a way that fits the threaded renderer.
+- **Hard crash (data abort / kernel panic) after a while during playback.** The first
+  0.1.2/0.1.3 smoothness attempt called `mpv_render_context_report_swap()` from the
+  main thread while `mpv_render_context_render()` ran on a background thread; mpv
+  requires both on the same thread, and the race corrupted mpv's timing state and then
+  the heap, crashing later inside libc's number/locale code. The single-threaded
+  renderer above removes the background render thread entirely, so the race can't occur.
+  Diagnosed from on-device Atmosphère crash reports (9 data aborts, all in that region).
 
 ## [0.1.3] - 2026-11-21
 
