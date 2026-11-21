@@ -54,7 +54,7 @@ public:
             App::get().traktScrobble("stop", ctx_.meta.id, ctx_.type, ctx_.season, ctx_.episode, pct);
         }
         saveProgress();
-        // Video is rendered on the main thread, so nothing else can touch the context now.
+        stopRenderThread();  // must finish before the render context is freed
         if (rctx_) mpv_render_context_free(rctx_);
         if (mpv_) mpv_terminate_destroy(mpv_);
         if (tex_) SDL_DestroyTexture(tex_);
@@ -125,9 +125,16 @@ public:
         SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
         SDL_RenderClear(R);
 
-        // Convert mpv's newest frame (YUV->RGB) on this thread, paced by display-resample,
-        // then draw it. The convert is multi-threaded internally so it stays within budget.
-        pumpVideo();
+        // Frames are converted (YUV->RGB + scaling) on a background thread; here we only
+        // upload the newest finished one, so the UI thread never stalls on conversion.
+        if (tex_) {
+            std::lock_guard<std::mutex> lk(frameMx_);
+            if (frameReady_) {
+                SDL_UpdateTexture(tex_, nullptr, frames_[front_], vw_ * 4);
+                frameReady_ = false;
+                haveFrame_ = true;
+            }
+        }
         if (tex_ && haveFrame_) SDL_RenderCopy(R, tex_, nullptr, nullptr);
 
         if (!error_.empty()) {
@@ -204,17 +211,12 @@ private:
         // saving, hard to see). Has no effect when hardware decoding is active.
         mpv_set_option_string(mpv_, "vd-lavc-skiploopfilter", "nonref");
         mpv_set_option_string(mpv_, "vd-lavc-fast", "yes");
-        // Smooth, judder-free playback on the fixed 60 Hz panel: resample the video clock to
-        // the display so every frame is held for a whole number of refreshes (clean 3:2 for
-        // 24p etc.) instead of landing at arbitrary vsync phases. This needs vblank feedback
-        // via mpv_render_context_report_swap(), which mpv requires on the SAME thread as
-        // render(). We satisfy that by running BOTH on the main thread (pumpVideo() in
-        // render(), report in onPresented()) - no background render thread, no cross-thread
-        // timing jitter. The panel is always 60 Hz, so pin it rather than measuring.
-        mpv_set_option_string(mpv_, "video-sync", "display-resample");
-        mpv_set_option_string(mpv_, "video-sync-max-video-change", "5");
-        mpv_set_option_string(mpv_, "display-fps-override", "60");
-        mpv_set_option_string(mpv_, "interpolation", "no");  // resample only reshows frames, never blends
+        // NOTE: video-sync=display-resample was tried here but reverted. It only works with
+        // mpv_render_context_report_swap(), which mpv requires to be called from the SAME
+        // thread as mpv_render_context_render(). Our renderer runs render() on a background
+        // thread while the SDL swap happens on the main thread, so reporting the swap from
+        // the main thread raced mpv's display-sync timing state and corrupted the heap
+        // (hard crash after a while in playback). Default audio sync is what we ship.
         // Drop late frames at the decoder instead of stuttering audio/video sync.
         mpv_set_option_string(mpv_, "framedrop", "decoder+vo");
         mpv_set_option_string(mpv_, "cache", "yes");
@@ -287,7 +289,7 @@ private:
         vh_ = st.render1080 ? 1080 : 720;
         tex_ = SDL_CreateTexture(R, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, vw_, vh_);
         if (tex_) SDL_SetTextureBlendMode(tex_, SDL_BLENDMODE_NONE);
-        allocFrameBuf();
+        startRenderThread();
         if (st.cpuBoost) boosted_ = R_SUCCEEDED(appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad));
 
         const store::Progress* p = store::progress(ctx_.videoId);
@@ -388,43 +390,68 @@ private:
         scrobblePlaying_ = playing;
     }
 
-    // ---------------------------------------------------------- video render (main thread)
-    // mpv's software renderer (YUV->RGB) runs on the main thread, right before the frame is
-    // presented, so mpv_render_context_report_swap() (onPresented, below) sits on the same
-    // thread with exact vsync timing - what display-resample needs to pace frames smoothly.
-    // zimg converts multi-threaded internally, so the call stays well inside the 16 ms budget
-    // (at 1080p source->1080p output it's a colour convert with no scaling).
-    void allocFrameBuf() {
+    // ---------------------------------------------------------- render thread
+    // mpv's software renderer (YUV->RGB, scaling to the output size) is the heaviest
+    // per-frame step. Running it here, double-buffered, lets it use another CPU core in
+    // parallel with the UI thread instead of eating into every 16 ms frame.
+    static void onMpvUpdate(void* ctx) {
+        auto* self = static_cast<PlayerScreen*>(ctx);
+        {
+            std::lock_guard<std::mutex> lk(self->wakeMx_);
+            self->wake_ = true;
+        }
+        self->wakeCv_.notify_one();
+    }
+
+    void startRenderThread() {
         if (!rctx_) return;
         size_t bytes = (size_t)vw_ * vh_ * 4;
-        frameStore_.assign(bytes + 64, 0);
-        uintptr_t p = (uintptr_t)frameStore_.data();
-        frameBuf_ = (uint8_t*)((p + 63) & ~(uintptr_t)63);  // 64-byte aligned for mpv's sw renderer
+        for (int i = 0; i < 2; i++) {
+            frameStore_[i].assign(bytes + 64, 0);
+            uintptr_t p = (uintptr_t)frameStore_[i].data();
+            frames_[i] = (uint8_t*)((p + 63) & ~(uintptr_t)63);  // 64-byte aligned for mpv's sw renderer
+        }
+        renderRun_ = true;
+        mpv_render_context_set_update_callback(rctx_, onMpvUpdate, this);
+        renderThread_ = std::thread([this] { renderLoop(); });
     }
 
-    // If mpv has a new frame ready, convert it into frameBuf_ and upload to the texture.
-    void pumpVideo() {
-        if (!rctx_ || !tex_ || !frameBuf_) return;
-        if (!(mpv_render_context_update(rctx_) & MPV_RENDER_UPDATE_FRAME)) return;
-        int size[2] = {vw_, vh_};
-        size_t stride = (size_t)vw_ * 4;
-        mpv_render_param params[] = {
-            {MPV_RENDER_PARAM_SW_SIZE, size},
-            {MPV_RENDER_PARAM_SW_FORMAT, (void*)"rgb0"},
-            {MPV_RENDER_PARAM_SW_STRIDE, &stride},
-            {MPV_RENDER_PARAM_SW_POINTER, frameBuf_},
-            {MPV_RENDER_PARAM_INVALID, nullptr},
-        };
-        mpv_render_context_render(rctx_, params);
-        SDL_UpdateTexture(tex_, nullptr, frameBuf_, vw_ * 4);
-        haveFrame_ = true;
+    void stopRenderThread() {
+        if (!renderThread_.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lk(wakeMx_);
+            renderRun_ = false;
+            wake_ = true;
+        }
+        wakeCv_.notify_one();
+        renderThread_.join();
+        if (rctx_) mpv_render_context_set_update_callback(rctx_, nullptr, nullptr);
     }
 
-    // Called on the main thread right after SDL_RenderPresent (a vsync-paced swap). render()
-    // happens on this same thread (pumpVideo), so reporting the swap here is both legal and
-    // perfectly timed - this is the beat display-resample locks the video cadence to.
-    void onPresented() override {
-        if (rctx_) mpv_render_context_report_swap(rctx_);
+    void renderLoop() {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(wakeMx_);
+                wakeCv_.wait_for(lk, std::chrono::milliseconds(100), [this] { return wake_ || !renderRun_; });
+                if (!renderRun_) break;
+                wake_ = false;
+            }
+            if (!(mpv_render_context_update(rctx_) & MPV_RENDER_UPDATE_FRAME)) continue;
+            int back = 1 - front_.load();
+            int size[2] = {vw_, vh_};
+            size_t stride = (size_t)vw_ * 4;
+            mpv_render_param params[] = {
+                {MPV_RENDER_PARAM_SW_SIZE, size},
+                {MPV_RENDER_PARAM_SW_FORMAT, (void*)"rgb0"},
+                {MPV_RENDER_PARAM_SW_STRIDE, &stride},
+                {MPV_RENDER_PARAM_SW_POINTER, frames_[back]},
+                {MPV_RENDER_PARAM_INVALID, nullptr},
+            };
+            mpv_render_context_render(rctx_, params);
+            std::lock_guard<std::mutex> lk(frameMx_);
+            front_ = back;
+            frameReady_ = true;
+        }
     }
 
     // CPU-decoding anything above 1440p overwhelms the Switch (that's what crashed on 4K).
@@ -765,9 +792,15 @@ private:
     bool haveFrame_ = false;
     bool boosted_ = false;
     bool scrobbleStarted_ = false, scrobblePlaying_ = false;
-    // single-threaded video frame buffer (mpv renders into it on the main thread)
-    std::vector<uint8_t> frameStore_;
-    uint8_t* frameBuf_ = nullptr;
+    // render thread state
+    std::thread renderThread_;
+    std::mutex wakeMx_, frameMx_;
+    std::condition_variable wakeCv_;
+    bool wake_ = false, renderRun_ = false;
+    std::vector<uint8_t> frameStore_[2];
+    uint8_t* frames_[2] = {nullptr, nullptr};
+    std::atomic<int> front_{0};
+    bool frameReady_ = false;
 
     double pos_ = 0, dur_ = 0;
     bool paused_ = false, buffering_ = true, loaded_ = false, ended_ = false;

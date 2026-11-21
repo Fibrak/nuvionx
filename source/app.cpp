@@ -184,8 +184,7 @@ void App::run() {
         drawToasts();
 
         if (store::settings().perfOverlay) drawPerfOverlay(dt);
-        SDL_RenderPresent(renderer_);  // vsync-paced: returns just after a vblank
-        if (!stack_.empty()) stack_.back()->onPresented();
+        SDL_RenderPresent(renderer_);
         gfx::endFrame();
 
         // Hard cap at 60 fps. Vsync normally paces us, but this guarantees we never run
