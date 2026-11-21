@@ -56,9 +56,20 @@ static Uint64 g_freq = 1, g_start = 0;
 double now() { return g_now.load(); }
 
 // ---------------------------------------------------------------- fonts / text
-static void* g_fontData = nullptr;
-static size_t g_fontSize = 0;
-static std::map<int, TTF_Font*> g_fonts;
+// Up to this many Switch system fonts: Standard (primary) + script/symbol fallbacks, so text
+// from sources using CJK, Korean or special symbols renders instead of "tofu" boxes. SDL_ttf
+// 2.x has no built-in fallback, so we pick a covering font per glyph and composite the runs.
+static const int kMaxFonts = 6;
+static void* g_fontData[kMaxFonts] = {nullptr};
+static size_t g_fontSize[kMaxFonts] = {0};
+static int g_fontCount = 0;
+
+struct FontSet {
+    TTF_Font* f[kMaxFonts] = {nullptr};
+    int n = 0;
+};
+static std::map<int, FontSet> g_fonts;
+static std::unordered_map<uint32_t, int> g_glyphFont;  // codepoint -> covering font index (size-independent)
 
 struct TextEntry {
     SDL_Texture* tex = nullptr;
@@ -69,16 +80,116 @@ static std::unordered_map<std::string, TextEntry> g_text;
 
 static int px(int size) { return std::max(6, (int)std::lround(size * S)); }
 
-static TTF_Font* font(int size, bool bold) {
+static FontSet& fontSet(int size, bool bold) {
     int p = px(size);
     int key = p * 2 + (bold ? 1 : 0);
     auto it = g_fonts.find(key);
     if (it != g_fonts.end()) return it->second;
-    SDL_RWops* rw = SDL_RWFromConstMem(g_fontData, (int)g_fontSize);
-    TTF_Font* f = rw ? TTF_OpenFontRW(rw, 1, p) : nullptr;
-    if (f && bold) TTF_SetFontStyle(f, TTF_STYLE_BOLD);
-    g_fonts[key] = f;
-    return f;
+    FontSet fs;
+    fs.n = g_fontCount;
+    for (int i = 0; i < g_fontCount; i++) {
+        SDL_RWops* rw = SDL_RWFromConstMem(g_fontData[i], (int)g_fontSize[i]);
+        fs.f[i] = rw ? TTF_OpenFontRW(rw, 1, p) : nullptr;
+        if (fs.f[i] && bold) TTF_SetFontStyle(fs.f[i], TTF_STYLE_BOLD);
+    }
+    auto res = g_fonts.emplace(key, fs);
+    return res.first->second;
+}
+
+// Primary font (index 0) for callers that measure one font (line height, family name).
+static TTF_Font* font(int size, bool bold) { return fontSet(size, bold).f[0]; }
+
+// Decode one UTF-8 codepoint starting at i, advancing i past it.
+static uint32_t utf8Next(const std::string& s, size_t& i) {
+    unsigned char c = (unsigned char)s[i];
+    uint32_t cp;
+    int len;
+    if (c < 0x80) { cp = c; len = 1; }
+    else if ((c >> 5) == 0x6) { cp = c & 0x1F; len = 2; }
+    else if ((c >> 4) == 0xE) { cp = c & 0x0F; len = 3; }
+    else if ((c >> 3) == 0x1E) { cp = c & 0x07; len = 4; }
+    else { i += 1; return c; }  // invalid lead byte: skip one
+    for (int k = 1; k < len; k++) {
+        if (i + k >= s.size() || ((unsigned char)s[i + k] & 0xC0) != 0x80) { len = k; break; }
+        cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3F);
+    }
+    i += len;
+    return cp;
+}
+
+// First font (primary first) that actually has this glyph; 0 (primary, may show tofu) if none.
+static int glyphFontIndex(uint32_t cp) {
+    auto it = g_glyphFont.find(cp);
+    if (it != g_glyphFont.end()) return it->second;
+    FontSet& fs = fontSet(20, false);  // coverage is the same at every size
+    int idx = 0;
+    for (int i = 0; i < fs.n; i++)
+        if (fs.f[i] && TTF_GlyphIsProvided32(fs.f[i], cp)) { idx = i; break; }
+    g_glyphFont[cp] = idx;
+    return idx;
+}
+
+struct TextRun {
+    int font;
+    size_t start, len;
+};
+// Split a string into maximal runs that each render with one (covering) font.
+static std::vector<TextRun> segmentText(const std::string& s) {
+    std::vector<TextRun> runs;
+    size_t i = 0;
+    int cur = -1;
+    size_t runStart = 0;
+    while (i < s.size()) {
+        size_t cpStart = i;
+        int fi = glyphFontIndex(utf8Next(s, i));
+        if (fi != cur) {
+            if (cur >= 0) runs.push_back({cur, runStart, cpStart - runStart});
+            cur = fi;
+            runStart = cpStart;
+        }
+    }
+    if (cur >= 0) runs.push_back({cur, runStart, s.size() - runStart});
+    return runs;
+}
+
+// Render white text, using a fallback font per glyph and compositing the runs baseline-aligned.
+static SDL_Surface* renderText(const std::string& s, int size, bool bold) {
+    FontSet& fs = fontSet(size, bold);
+    if (!fs.f[0]) return nullptr;
+    const SDL_Color white{255, 255, 255, 255};
+    std::vector<TextRun> runs = segmentText(s);
+    if (runs.size() <= 1) {  // fast path: one font covers the whole string
+        TTF_Font* f = (!runs.empty() && fs.f[runs[0].font]) ? fs.f[runs[0].font] : fs.f[0];
+        return TTF_RenderUTF8_Blended(f, s.c_str(), white);
+    }
+    std::vector<SDL_Surface*> parts;
+    int totalW = 0, maxAsc = 0, maxDesc = 0;
+    for (auto& r : runs) {
+        TTF_Font* f = fs.f[r.font] ? fs.f[r.font] : fs.f[0];
+        SDL_Surface* su = TTF_RenderUTF8_Blended(f, s.substr(r.start, r.len).c_str(), white);
+        parts.push_back(su);
+        int asc = TTF_FontAscent(f), desc = -TTF_FontDescent(f);
+        maxAsc = std::max(maxAsc, asc);
+        maxDesc = std::max(maxDesc, desc);
+        if (su) totalW += su->w;
+    }
+    SDL_Surface* out =
+        SDL_CreateRGBSurfaceWithFormat(0, std::max(1, totalW), std::max(1, maxAsc + maxDesc), 32, SDL_PIXELFORMAT_ARGB8888);
+    if (out) {
+        int x = 0;
+        for (size_t k = 0; k < runs.size(); k++) {
+            SDL_Surface* su = parts[k];
+            if (!su) continue;
+            TTF_Font* f = fs.f[runs[k].font] ? fs.f[runs[k].font] : fs.f[0];
+            SDL_SetSurfaceBlendMode(su, SDL_BLENDMODE_NONE);  // copy pixels (incl. alpha), don't blend
+            SDL_Rect dst{x, maxAsc - TTF_FontAscent(f), su->w, su->h};
+            SDL_BlitSurface(su, nullptr, out, &dst);
+            x += su->w;
+        }
+    }
+    for (SDL_Surface* su : parts)
+        if (su) SDL_FreeSurface(su);
+    return out;
 }
 
 std::string fontFamily() {
@@ -88,8 +199,8 @@ std::string fontFamily() {
 }
 
 const void* fontData(size_t* size) {
-    if (size) *size = g_fontSize;
-    return g_fontData;
+    if (size) *size = g_fontSize[0];
+    return g_fontData[0];
 }
 
 float lineHeight(int size) {
@@ -99,10 +210,15 @@ float lineHeight(int size) {
 
 float textWidth(const std::string& s, int size, bool bold) {
     if (s.empty()) return 0;
-    TTF_Font* f = font(size, bold);
-    int w = 0, h = 0;
-    if (!f || TTF_SizeUTF8(f, s.c_str(), &w, &h) != 0) return 0;
-    return w / S;
+    FontSet& fs = fontSet(size, bold);
+    if (!fs.f[0]) return 0;
+    std::vector<TextRun> runs = segmentText(s);
+    int total = 0, w = 0, h = 0;
+    for (auto& r : runs) {
+        TTF_Font* f = fs.f[r.font] ? fs.f[r.font] : fs.f[0];
+        if (TTF_SizeUTF8(f, s.substr(r.start, r.len).c_str(), &w, &h) == 0) total += w;
+    }
+    return total / S;
 }
 
 static size_t prevCodepoint(const std::string& s, size_t i) {
@@ -143,9 +259,7 @@ static TextEntry* textTex(const std::string& s, int size, bool bold) {
         it->second.lastUse = now();
         return &it->second;
     }
-    TTF_Font* f = font(size, bold);
-    if (!f) return nullptr;
-    SDL_Surface* surf = TTF_RenderUTF8_Blended(f, s.c_str(), SDL_Color{255, 255, 255, 255});
+    SDL_Surface* surf = renderText(s, size, bold);
     if (!surf) return nullptr;
     TextEntry e;
     e.tex = SDL_CreateTextureFromSurface(R, surf);
@@ -809,10 +923,23 @@ bool init(SDL_Renderer* r, int pixelW, int pixelH) {
     if (TTF_Init() != 0) return false;
     IMG_Init(IMG_INIT_JPG | IMG_INIT_PNG | IMG_INIT_WEBP);
 
-    PlFontData fd;
-    if (R_FAILED(plGetSharedFontByType(&fd, PlSharedFontType_Standard))) return false;
-    g_fontData = fd.address;
-    g_fontSize = fd.size;
+    // Primary font + script/symbol fallbacks (shared system memory, no copy). Order = priority:
+    // a glyph is taken from the first of these that provides it.
+    auto addFont = [](PlSharedFontType type) {
+        PlFontData fd;
+        if (g_fontCount < kMaxFonts && R_SUCCEEDED(plGetSharedFontByType(&fd, type))) {
+            g_fontData[g_fontCount] = fd.address;
+            g_fontSize[g_fontCount] = fd.size;
+            g_fontCount++;
+        }
+    };
+    addFont(PlSharedFontType_Standard);  // Latin, Cyrillic, Greek, Japanese, common symbols
+    addFont(PlSharedFontType_NintendoExt);          // extra symbols / pictographs
+    addFont(PlSharedFontType_ChineseSimplified);
+    addFont(PlSharedFontType_ExtChineseSimplified);
+    addFont(PlSharedFontType_ChineseTraditional);
+    addFont(PlSharedFontType_KO);  // Korean
+    if (g_fontCount == 0) return false;
 
     trimDiskCache();
     g_imgStop = false;
@@ -836,7 +963,8 @@ void shutdown() {
     for (auto& kv : g_text) SDL_DestroyTexture(kv.second.tex);
     g_text.clear();
     for (auto& kv : g_fonts)
-        if (kv.second) TTF_CloseFont(kv.second);
+        for (int i = 0; i < kv.second.n; i++)
+            if (kv.second.f[i]) TTF_CloseFont(kv.second.f[i]);
     g_fonts.clear();
     IMG_Quit();
     TTF_Quit();
