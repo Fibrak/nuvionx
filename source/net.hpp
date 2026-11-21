@@ -18,10 +18,13 @@ void beginShutdown();  // abort in-flight transfers (call before joining other t
 void shutdown();
 
 // Blocking GET. Safe to call from any worker thread (one curl handle per thread).
-Response get(const std::string& url, const std::vector<std::string>& headers = {}, long timeoutSec = 25);
+// maxBytes caps how much of the response is buffered in RAM; a larger response is
+// aborted with CURLE_WRITE_ERROR. The self-updater raises it for the ~30 MB .nro.
+Response get(const std::string& url, const std::vector<std::string>& headers = {}, long timeoutSec = 25,
+             size_t maxBytes = 24u * 1024u * 1024u);
 // Generic request: method "GET", "POST", "DELETE"...; body sent as-is.
 Response request(const std::string& method, const std::string& url, const std::vector<std::string>& headers,
-                 const std::string& body = "", long timeoutSec = 25);
+                 const std::string& body = "", long timeoutSec = 25, size_t maxBytes = 24u * 1024u * 1024u);
 // multipart/form-data POST with simple text fields.
 Response postMultipart(const std::string& url, const std::vector<std::string>& headers,
                        const std::vector<std::pair<std::string, std::string>>& fields, long timeoutSec = 30);

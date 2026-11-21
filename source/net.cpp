@@ -82,12 +82,19 @@ void threadCleanup() {
     }
 }
 
+struct WriteCtx {
+    std::string* buf;
+    size_t cap;  // refuse to grow past this many bytes (protects RAM)
+};
+
 static size_t writeCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    auto* s = static_cast<std::string*>(userdata);
+    auto* ctx = static_cast<WriteCtx*>(userdata);
     size_t n = size * nmemb;
-    // hard cap at 24 MiB to protect memory
-    if (s->size() + n > 24u * 1024u * 1024u) return 0;
-    s->append(ptr, n);
+    // Returning < n makes curl abort with CURLE_WRITE_ERROR ("Failed writing
+    // received data to disk/application"), which is what we want when a response
+    // is bigger than the caller is willing to buffer.
+    if (ctx->buf->size() + n > ctx->cap) return 0;
+    ctx->buf->append(ptr, n);
     return n;
 }
 
@@ -95,17 +102,17 @@ static int progressCb(void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
     return g_abort.load() ? 1 : 0;
 }
 
-Response get(const std::string& url, const std::vector<std::string>& headers, long timeoutSec) {
-    return request("GET", url, headers, "", timeoutSec);
+Response get(const std::string& url, const std::vector<std::string>& headers, long timeoutSec, size_t maxBytes) {
+    return request("GET", url, headers, "", timeoutSec, maxBytes);
 }
 
 static Response perform(const std::string& method, const std::string& url, const std::vector<std::string>& headers,
                         const std::string* body, curl_mime* (*makeMime)(CURL*, const void*), const void* mimeArg,
-                        long timeoutSec);
+                        long timeoutSec, size_t maxBytes);
 
 Response request(const std::string& method, const std::string& url, const std::vector<std::string>& headers,
-                 const std::string& body, long timeoutSec) {
-    return perform(method, url, headers, method == "GET" ? nullptr : &body, nullptr, nullptr, timeoutSec);
+                 const std::string& body, long timeoutSec, size_t maxBytes) {
+    return perform(method, url, headers, method == "GET" ? nullptr : &body, nullptr, nullptr, timeoutSec, maxBytes);
 }
 
 static curl_mime* buildMime(CURL* h, const void* arg) {
@@ -121,12 +128,12 @@ static curl_mime* buildMime(CURL* h, const void* arg) {
 
 Response postMultipart(const std::string& url, const std::vector<std::string>& headers,
                        const std::vector<std::pair<std::string, std::string>>& fields, long timeoutSec) {
-    return perform("POST", url, headers, nullptr, buildMime, &fields, timeoutSec);
+    return perform("POST", url, headers, nullptr, buildMime, &fields, timeoutSec, 24u * 1024u * 1024u);
 }
 
 static Response perform(const std::string& method, const std::string& url, const std::vector<std::string>& headers,
                         const std::string* body, curl_mime* (*makeMime)(CURL*, const void*), const void* mimeArg,
-                        long timeoutSec) {
+                        long timeoutSec, size_t maxBytes) {
     Response res;
     if (g_abort.load()) {
         res.error = "aborted";
@@ -147,8 +154,9 @@ static Response perform(const std::string& method, const std::string& url, const
     curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(h, CURLOPT_USERAGENT, kUserAgent);
+    WriteCtx wctx{&res.body, maxBytes};
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeCb);
-    curl_easy_setopt(h, CURLOPT_WRITEDATA, &res.body);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &wctx);
     curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
     curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, progressCb);
     // Don't keep idle connections around: with the libnx TLS backend every idle HTTPS

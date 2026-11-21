@@ -2,6 +2,17 @@
 
 All notable changes to NuvioNX are documented here.
 
+## [0.1.3] - 2026-11-21
+
+### Fixed
+- **In-app update failing with "Failed writing received data to disk/application."**
+  The HTTP layer capped every response at 24 MiB, but the update binary is ~30 MB,
+  so the download was aborted just as it finished. The updater now buffers up to
+  48 MiB; the cap stays 24 MiB for normal API/catalog/image traffic.
+  - Note: builds 0.1.2 and earlier carry the old cap, so their in-app updater can't
+    fetch this fix — install 0.1.3 once from the SD zip, and future updates work
+    from inside the app.
+
 ## [0.1.2] - 2026-11-21
 
 ### Added

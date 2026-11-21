@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 
 APP_TITLE   := NuvioNX
 APP_AUTHOR  := NuvioNX contributors (port of NuvioTV)
-APP_VERSION := 0.1.2
+APP_VERSION := 0.1.3
 
 TARGET   := nuvionx
 BUILD    := build

@@ -92,7 +92,9 @@ bool download(const std::string& url, std::string& err) {
         err = "Can't locate the app's .nro on the SD card";
         return false;
     }
-    net::Response resp = net::get(url, {}, 180);  // ~15 MB over Switch Wi-Fi
+    // The .nro is ~30 MB; raise net's default 24 MiB buffer cap so the download
+    // isn't aborted mid-stream (that showed up as "Failed writing received data").
+    net::Response resp = net::get(url, {}, 180, 48u * 1024u * 1024u);
     if (!resp.ok()) {
         err = resp.error.empty() ? ("Download failed (" + std::to_string(resp.status) + ")") : resp.error;
         return false;
