@@ -11,7 +11,8 @@ struct Settings {
     int theme = 0;
     std::string subLang = "eng";   // ISO 639-2, "" = off
     std::string audioLang = "";    // "" = file default
-    bool render1080 = false;       // render video at 1080p (heavier on CPU)
+    bool render1080 = false;       // render video at 1080p (heavier on CPU; software path only)
+    bool gpuVideo = false;         // render video on the GPU (OpenGL) instead of the CPU (software)
     bool showUnsupported = true;   // list torrent/YouTube streams (greyed out)
     bool hide4k = false;           // hide streams above 1080p (4K/UHD/1440p) from sources
     bool autoplayNext = true;

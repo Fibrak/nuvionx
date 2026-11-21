@@ -103,12 +103,13 @@ public:
             }
         }
         if (sel_ == 15) return {{"A", confirm_ && now() < confirmUntil_ ? "Press again to clear" : "Clear"}};
-        if (sel_ >= 16) return {};
+        if (sel_ == 16) return {{"A", "Toggle"}};
+        if (sel_ >= 17) return {};
         return {{"<>", "Change"}};
     }
 
 private:
-    static const int kCount = 17;
+    static const int kCount = 18;
 
     static std::string masked(const std::string& k) {
         if (k.empty()) return "Not set";
@@ -134,6 +135,7 @@ private:
             case 13: return "Premiumize API key";
             case 14: return "Software update";
             case 15: return "Clear watch history";
+            case 16: return "GPU video (experimental)";
             default:
                 return std::string("NuvioNX ") + update::currentVersion() +
                        "  -  unofficial Switch port of NuvioTV (GPL-3.0)";
@@ -164,6 +166,7 @@ private:
             case 13: return masked(s.premiumizeKey);
             case 14: return updateValue();
             case 15: return std::to_string(store::continueWatching(1000).size()) + " in progress";
+            case 16: return s.gpuVideo ? "On (GPU - smooth, less CPU)" : "Off (software/CPU)";
             default: return "";
         }
     }
@@ -230,6 +233,11 @@ private:
                     confirmUntil_ = now() + 3;
                 }
                 return;
+            case 16:
+                s.gpuVideo = !s.gpuVideo;
+                App::get().toast(s.gpuVideo ? "GPU video on - applies to the next video"
+                                            : "GPU video off - applies to the next video");
+                break;
             default: return;
         }
         store::saveSettings();

@@ -3,6 +3,7 @@
 // resume + progress saving, next-episode autoplay.
 #include <mpv/client.h>
 #include <mpv/render.h>
+#include <mpv/render_gl.h>
 #include <switch.h>
 
 #include <algorithm>
@@ -125,17 +126,23 @@ public:
         SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
         SDL_RenderClear(R);
 
-        // Frames are converted (YUV->RGB + scaling) on a background thread; here we only
-        // upload the newest finished one, so the UI thread never stalls on conversion.
-        if (tex_) {
-            std::lock_guard<std::mutex> lk(frameMx_);
-            if (frameReady_) {
-                SDL_UpdateTexture(tex_, nullptr, frames_[front_], vw_ * 4);
-                frameReady_ = false;
-                haveFrame_ = true;
+        if (useGl_) {
+            // GPU path: mpv draws the video straight onto the window framebuffer (GPU does
+            // the convert + scale). UI drawn by SDL on top afterwards.
+            renderVideoGl();
+        } else {
+            // Software path: frames are converted on a background thread; here we only upload
+            // the newest finished one, so the UI thread never stalls on conversion.
+            if (tex_) {
+                std::lock_guard<std::mutex> lk(frameMx_);
+                if (frameReady_) {
+                    SDL_UpdateTexture(tex_, nullptr, frames_[front_], vw_ * 4);
+                    frameReady_ = false;
+                    haveFrame_ = true;
+                }
             }
+            if (tex_ && haveFrame_) SDL_RenderCopy(R, tex_, nullptr, nullptr);
         }
-        if (tex_ && haveFrame_) SDL_RenderCopy(R, tex_, nullptr, nullptr);
 
         if (!error_.empty()) {
             fillRect(0, 0, W, H, withA(t.bg, 230));
@@ -266,14 +273,37 @@ private:
             error_ = "mpv failed to initialise.";
             return;
         }
-        mpv_render_param params[] = {
-            {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_SW},
-            {MPV_RENDER_PARAM_INVALID, nullptr},
-        };
-        if (mpv_render_context_create(&rctx_, mpv_, params) < 0) {
-            rctx_ = nullptr;
-            error_ = "mpv software renderer unavailable.";
-            return;
+        // GPU path (opt-in): mpv renders on the GPU via OpenGL, so the YUV->RGB convert and
+        // scaling run on the Tegra GPU instead of the CPU - the fix for CPU-bound frame drops
+        // at 1080p. Falls back to the software renderer if the GL context can't be created.
+        useGl_ = store::settings().gpuVideo;
+        if (useGl_) {
+            mpv_opengl_init_params gl{};
+            gl.get_proc_address = [](void*, const char* name) -> void* { return (void*)SDL_GL_GetProcAddress(name); };
+            gl.get_proc_address_ctx = nullptr;
+            mpv_render_param glp[] = {
+                {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
+                {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl},
+                {MPV_RENDER_PARAM_INVALID, nullptr},
+            };
+            if (mpv_render_context_create(&rctx_, mpv_, glp) < 0) {
+                rctx_ = nullptr;
+                useGl_ = false;  // fall back to software so playback still works
+                log("NuvioNX: OpenGL render unavailable, using software renderer");
+            } else {
+                log("NuvioNX: using OpenGL (GPU) renderer");
+            }
+        }
+        if (!rctx_) {
+            mpv_render_param params[] = {
+                {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_SW},
+                {MPV_RENDER_PARAM_INVALID, nullptr},
+            };
+            if (mpv_render_context_create(&rctx_, mpv_, params) < 0) {
+                rctx_ = nullptr;
+                error_ = "mpv renderer unavailable.";
+                return;
+            }
         }
         mpv_observe_property(mpv_, 1, "time-pos", MPV_FORMAT_DOUBLE);
         mpv_observe_property(mpv_, 2, "duration", MPV_FORMAT_DOUBLE);
@@ -285,11 +315,15 @@ private:
         mpv_observe_property(mpv_, 8, "audio-params/channel-count", MPV_FORMAT_INT64);
         mpv_observe_property(mpv_, 9, "video-params/h", MPV_FORMAT_INT64);
 
-        vw_ = st.render1080 ? 1920 : 1280;
-        vh_ = st.render1080 ? 1080 : 720;
-        tex_ = SDL_CreateTexture(R, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, vw_, vh_);
-        if (tex_) SDL_SetTextureBlendMode(tex_, SDL_BLENDMODE_NONE);
-        startRenderThread();
+        if (!useGl_) {
+            // Software path: convert into an SDL streaming texture on a background thread.
+            vw_ = st.render1080 ? 1920 : 1280;
+            vh_ = st.render1080 ? 1080 : 720;
+            tex_ = SDL_CreateTexture(R, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, vw_, vh_);
+            if (tex_) SDL_SetTextureBlendMode(tex_, SDL_BLENDMODE_NONE);
+            startRenderThread();
+        }
+        // GPU path renders straight to the window framebuffer on the main thread (renderVideoGl).
         if (st.cpuBoost) boosted_ = R_SUCCEEDED(appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad));
 
         const store::Progress* p = store::progress(ctx_.videoId);
@@ -390,7 +424,28 @@ private:
         scrobblePlaying_ = playing;
     }
 
-    // ---------------------------------------------------------- render thread
+    // GPU render: draw the current mpv video frame onto the window framebuffer (FBO 0).
+    // Runs on the main thread with SDL's GL context current. SDL_RenderFlush lets SDL and
+    // raw GL (mpv) share the context; mpv restores GL state afterwards so SDL keeps drawing.
+    void renderVideoGl() {
+        if (!rctx_) return;
+        SDL_RenderFlush(R);
+        int w = 0, h = 0;
+        SDL_GetRendererOutputSize(R, &w, &h);
+        mpv_opengl_fbo fbo{};
+        fbo.fbo = 0;  // the window's default framebuffer
+        fbo.w = w;
+        fbo.h = h;
+        int flip = 1;  // GL is bottom-up; flip to match SDL's top-left origin
+        mpv_render_param params[] = {
+            {MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
+            {MPV_RENDER_PARAM_FLIP_Y, &flip},
+            {MPV_RENDER_PARAM_INVALID, nullptr},
+        };
+        mpv_render_context_render(rctx_, params);
+    }
+
+    // ---------------------------------------------------------- render thread (software path)
     // mpv's software renderer (YUV->RGB, scaling to the output size) is the heaviest
     // per-frame step. Running it here, double-buffered, lets it use another CPU core in
     // parallel with the UI thread instead of eating into every 16 ms frame.
@@ -790,6 +845,7 @@ private:
     SDL_Texture* tex_ = nullptr;
     int vw_ = 1280, vh_ = 720;
     bool haveFrame_ = false;
+    bool useGl_ = false;  // GPU (OpenGL) render path instead of the software path
     bool boosted_ = false;
     bool scrobbleStarted_ = false, scrobblePlaying_ = false;
     // render thread state

@@ -62,6 +62,7 @@ void load() {
         g_settings.subLang = v["subLang"].str("eng");
         g_settings.audioLang = v["audioLang"].str("");
         g_settings.render1080 = v["render1080"].boolean(false);
+        g_settings.gpuVideo = v["gpuVideo"].boolean(false);
         g_settings.showUnsupported = v["showUnsupported"].boolean(true);
         g_settings.hide4k = v["hide4k"].boolean(false);
         g_settings.autoplayNext = v["autoplayNext"].boolean(true);
@@ -131,6 +132,7 @@ void saveSettings() {
     o.set("subLang", g_settings.subLang);
     o.set("audioLang", g_settings.audioLang);
     o.set("render1080", g_settings.render1080);
+    o.set("gpuVideo", g_settings.gpuVideo);
     o.set("showUnsupported", g_settings.showUnsupported);
     o.set("hide4k", g_settings.hide4k);
     o.set("autoplayNext", g_settings.autoplayNext);

@@ -75,7 +75,10 @@ bool App::init() {
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) return false;
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
-    window_ = SDL_CreateWindow("NuvioNX", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1920, 1080, 0);
+    // SDL_WINDOW_OPENGL so SDL_GL_GetProcAddress works for the mpv OpenGL render path
+    // (the Switch SDL renderer is GLES2 anyway); the 2D UI still goes through SDL_Renderer.
+    window_ = SDL_CreateWindow("NuvioNX", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1920, 1080,
+                               SDL_WINDOW_OPENGL);
     if (!window_) return false;
     renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer_) return false;
