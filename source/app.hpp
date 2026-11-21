@@ -62,6 +62,7 @@ public:
     void moveAddon(size_t i, int dir);
 
     std::string lanUrl() const;
+    SDL_Window* window() const { return window_; }  // for the player's mpv OpenGL context
     int memoryBudgetMB() const { return memoryMB_; }
     // Battery charge 0-100 (-1 if unavailable) and whether a charger is connected.
     int batteryPercent(bool* charging = nullptr) const;

@@ -55,8 +55,14 @@ public:
             App::get().traktScrobble("stop", ctx_.meta.id, ctx_.type, ctx_.season, ctx_.episode, pct);
         }
         saveProgress();
-        stopRenderThread();  // must finish before the render context is freed
-        if (rctx_) mpv_render_context_free(rctx_);
+        stopRenderThread();  // (software path) must finish before the render context is freed
+        if (rctx_) {
+            // free mpv's GL objects on its own context, then hand the context back to SDL
+            if (useGl_ && win_ && mpvGlCtx_) SDL_GL_MakeCurrent(win_, mpvGlCtx_);
+            mpv_render_context_free(rctx_);
+            if (useGl_ && win_ && sdlGlCtx_) SDL_GL_MakeCurrent(win_, sdlGlCtx_);
+        }
+        if (mpvGlCtx_) SDL_GL_DeleteContext(mpvGlCtx_);
         if (mpv_) mpv_terminate_destroy(mpv_);
         if (tex_) SDL_DestroyTexture(tex_);
         store::flush();  // one SD write per viewing session instead of one every 15 s
@@ -278,20 +284,39 @@ private:
         // at 1080p. Falls back to the software renderer if the GL context can't be created.
         useGl_ = store::settings().gpuVideo;
         if (useGl_) {
-            mpv_opengl_init_params gl{};
-            gl.get_proc_address = [](void*, const char* name) -> void* { return (void*)SDL_GL_GetProcAddress(name); };
-            gl.get_proc_address_ctx = nullptr;
-            mpv_render_param glp[] = {
-                {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
-                {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl},
-                {MPV_RENDER_PARAM_INVALID, nullptr},
-            };
-            if (mpv_render_context_create(&rctx_, mpv_, glp) < 0) {
-                rctx_ = nullptr;
-                useGl_ = false;  // fall back to software so playback still works
-                log("NuvioNX: OpenGL render unavailable, using software renderer");
+            win_ = App::get().window();
+            sdlGlCtx_ = SDL_GL_GetCurrentContext();  // SDL_Renderer's GL context
+            // Give mpv its OWN GL context that shares objects with SDL's. mpv resets GL state
+            // to defaults on every render; a separate context keeps that from corrupting
+            // SDL's cached state (which otherwise left the UI "bugged out").
+            SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+            mpvGlCtx_ = (win_ && sdlGlCtx_) ? SDL_GL_CreateContext(win_) : nullptr;  // becomes current
+            if (!mpvGlCtx_) {
+                useGl_ = false;
+                if (win_ && sdlGlCtx_) SDL_GL_MakeCurrent(win_, sdlGlCtx_);
+                log("NuvioNX: couldn't create a shared GL context, using software renderer");
             } else {
-                log("NuvioNX: using OpenGL (GPU) renderer");
+                mpv_opengl_init_params gl{};
+                gl.get_proc_address = [](void*, const char* name) -> void* {
+                    return (void*)SDL_GL_GetProcAddress(name);
+                };
+                gl.get_proc_address_ctx = nullptr;
+                mpv_render_param glp[] = {
+                    {MPV_RENDER_PARAM_API_TYPE, (void*)MPV_RENDER_API_TYPE_OPENGL},
+                    {MPV_RENDER_PARAM_OPENGL_INIT_PARAMS, &gl},
+                    {MPV_RENDER_PARAM_INVALID, nullptr},
+                };
+                int rc = mpv_render_context_create(&rctx_, mpv_, glp);  // on mpv's context
+                SDL_GL_MakeCurrent(win_, sdlGlCtx_);                    // hand the context back to SDL
+                if (rc < 0) {
+                    rctx_ = nullptr;
+                    useGl_ = false;
+                    SDL_GL_DeleteContext(mpvGlCtx_);
+                    mpvGlCtx_ = nullptr;
+                    log("NuvioNX: OpenGL render unavailable, using software renderer");
+                } else {
+                    log("NuvioNX: using OpenGL (GPU) renderer with a shared context");
+                }
             }
         }
         if (!rctx_) {
@@ -428,12 +453,13 @@ private:
     // Runs on the main thread with SDL's GL context current. SDL_RenderFlush lets SDL and
     // raw GL (mpv) share the context; mpv restores GL state afterwards so SDL keeps drawing.
     void renderVideoGl() {
-        if (!rctx_) return;
-        SDL_RenderFlush(R);
+        if (!rctx_ || !win_ || !mpvGlCtx_) return;
+        SDL_RenderFlush(R);                    // finish SDL's queued GL work on its context
+        SDL_GL_MakeCurrent(win_, mpvGlCtx_);   // switch to mpv's isolated context
         int w = 0, h = 0;
         SDL_GetRendererOutputSize(R, &w, &h);
         mpv_opengl_fbo fbo{};
-        fbo.fbo = 0;  // the window's default framebuffer
+        fbo.fbo = 0;  // default framebuffer = the shared window surface
         fbo.w = w;
         fbo.h = h;
         int flip = 1;  // GL is bottom-up; flip to match SDL's top-left origin
@@ -443,6 +469,7 @@ private:
             {MPV_RENDER_PARAM_INVALID, nullptr},
         };
         mpv_render_context_render(rctx_, params);
+        SDL_GL_MakeCurrent(win_, sdlGlCtx_);   // hand the context back to SDL for the UI
     }
 
     // ---------------------------------------------------------- render thread (software path)
@@ -846,6 +873,9 @@ private:
     int vw_ = 1280, vh_ = 720;
     bool haveFrame_ = false;
     bool useGl_ = false;  // GPU (OpenGL) render path instead of the software path
+    SDL_Window* win_ = nullptr;
+    SDL_GLContext sdlGlCtx_ = nullptr;  // SDL_Renderer's context
+    SDL_GLContext mpvGlCtx_ = nullptr;  // mpv's own context, sharing objects with SDL's
     bool boosted_ = false;
     bool scrobbleStarted_ = false, scrobblePlaying_ = false;
     // render thread state

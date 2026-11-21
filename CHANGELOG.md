@@ -8,8 +8,10 @@ All notable changes to NuvioNX are documented here.
 - **GPU video rendering (experimental)** — Settings → *GPU video*. Renders video
   through mpv's OpenGL path so the Tegra GPU does the YUV→RGB convert and scaling
   instead of the CPU. The software path overloaded the CPU at 1080p and dropped
-  frames; this offloads that work to the (otherwise idle) GPU. Off by default; falls
-  back to the software renderer automatically if the GL context can't be created.
+  frames; this offloads that work to the (otherwise idle) GPU. mpv runs on its own
+  GL context that shares objects with SDL's, so mpv resetting GL state to defaults
+  on each frame can't corrupt the SDL-rendered UI. Off by default; falls back to the
+  software renderer automatically if a shared GL context can't be created.
 
 ### Fixed
 - **Hard crash (data abort / kernel panic) after a while during playback.** The
