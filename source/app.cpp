@@ -123,6 +123,7 @@ bool App::init() {
 void App::run() {
     double last = 0;
     double lastActive = gfx::now();  // last time something changed (input, background result, toast)
+    int curSwapInterval = 1;         // GPU vsync divisor currently set (1 = 60 Hz)
     while (!quit_ && appletMainLoop()) {
         gfx::beginFrame();
         double t = gfx::now();
@@ -207,6 +208,28 @@ void App::run() {
         if (activity || !toasts_.empty()) lastActive = t;
         bool maxFps = stack_.empty() || stack_.back()->wantsMaxFps();
         double sinceActive = t - lastActive;
+
+        // A screen that must present every produced frame (the player) is paced by the GPU
+        // swap interval, NOT by a manual sleep. Sleeping *and* waiting on vsync fight each
+        // other - the sleep pushes the present past a vblank, so vsync waits for the next one
+        // and the rate halves (a 30 fps target became 15). Translate the screen's frameCap
+        // into a vsync divisor (30 fps = present every 2nd vblank) and let SDL_RenderPresent
+        // block to pace it exactly and smoothly.
+        double cap = (focused && !stack_.empty()) ? stack_.back()->frameCap() : 0.0;
+        int wantInterval = 1;
+        if (cap > 0.0) {
+            wantInterval = (int)(60.0 / cap + 0.5);
+            if (wantInterval < 1) wantInterval = 1;
+            if (wantInterval > 4) wantInterval = 4;
+        }
+        if (focused && wantInterval != curSwapInterval) {
+            SDL_GL_SetSwapInterval(wantInterval);
+            curSwapInterval = wantInterval;
+        }
+
+        // Manual frame limiter for everything that ISN'T vsync-paced: menus when idle, and any
+        // screen while off-screen (we skip the present there, so vsync can't pace us).
+        bool vsyncPaced = focused && maxFps;
         double kFrame = 1.0 / 60.0;
         if (!focused) {
             kFrame = 1.0 / 10.0;  // off-screen: idle hard (no present to vsync-pace us)
@@ -214,14 +237,10 @@ void App::run() {
             if (sinceActive > 10.0) kFrame = 1.0 / 15.0;      // deep idle
             else if (sinceActive > 2.0) kFrame = 1.0 / 30.0;  // idle
         }
-        // Per-screen explicit cap (player "movie mode": match the video's frame rate during
-        // steady playback). Only ever lowers the rate, never raises it past the logic above.
-        if (focused && !stack_.empty()) {
-            double cap = stack_.back()->frameCap();
-            if (cap > 0.0 && 1.0 / cap > kFrame) kFrame = 1.0 / cap;
+        if (!vsyncPaced) {
+            double spent = gfx::now() - t;
+            if (spent < kFrame) svcSleepThread((u64)((kFrame - spent) * 1e9));
         }
-        double spent = gfx::now() - t;
-        if (spent < kFrame) svcSleepThread((u64)((kFrame - spent) * 1e9));
     }
 }
 
