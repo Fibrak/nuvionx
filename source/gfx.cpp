@@ -78,6 +78,15 @@ struct TextEntry {
 };
 static std::unordered_map<std::string, TextEntry> g_text;
 
+// Cache of ellipsize() results. ellipsize runs a binary search that measures the
+// string several times with SDL_ttf; card titles don't change between frames, so
+// without this the main thread re-measures the whole visible grid every frame.
+struct ElEntry {
+    std::string out;
+    double lastUse = 0;
+};
+static std::unordered_map<std::string, ElEntry> g_ellip;
+
 static int px(int size) { return std::max(6, (int)std::lround(size * S)); }
 
 static FontSet& fontSet(int size, bool bold) {
@@ -249,6 +258,26 @@ static std::string ellipsize(const std::string& s, int size, bool bold, float ma
     return out + dots;
 }
 
+// Cached wrapper: ellipsize() is pure for a given (string, size, bold, width), and
+// those are stable frame-to-frame for menu labels, so we only pay the measuring
+// cost once per unique label instead of every frame.
+static const std::string& ellipsizeCached(const std::string& s, int size, bool bold, float maxW) {
+    std::string key = s;
+    key += '\x1f';
+    key += std::to_string(px(size));
+    key += bold ? 'b' : 'r';
+    key += '\x1f';
+    key += std::to_string((int)std::lround(maxW * S));
+    auto it = g_ellip.find(key);
+    if (it != g_ellip.end()) {
+        it->second.lastUse = now();
+        return it->second.out;
+    }
+    auto res = g_ellip.emplace(key, ElEntry{ellipsize(s, size, bold, maxW), now()});
+    res.first->second.lastUse = now();
+    return res.first->second.out;
+}
+
 static TextEntry* textTex(const std::string& s, int size, bool bold) {
     std::string key = s;
     key += '\x1f';
@@ -275,7 +304,7 @@ static TextEntry* textTex(const std::string& s, int size, bool bold) {
 
 float text(const std::string& s0, float x, float y, int size, Col c, bool bold, Align al, float maxW) {
     if (s0.empty() || c.a == 0) return 0;
-    std::string s = maxW > 0 ? ellipsize(s0, size, bold, maxW) : s0;
+    const std::string& s = maxW > 0 ? ellipsizeCached(s0, size, bold, maxW) : s0;
     TextEntry* e = textTex(s, size, bold);
     if (!e) return 0;
     float w = e->w / S;
@@ -899,8 +928,14 @@ static void gcImages() {
 }
 
 static void gcText() {
-    if (g_text.size() < 600) return;
     double t = now();
+    if (g_ellip.size() >= 800) {
+        for (auto it = g_ellip.begin(); it != g_ellip.end();) {
+            if (t - it->second.lastUse > 3.0) it = g_ellip.erase(it);
+            else ++it;
+        }
+    }
+    if (g_text.size() < 600) return;
     for (auto it = g_text.begin(); it != g_text.end();) {
         if (t - it->second.lastUse > 3.0) {
             SDL_DestroyTexture(it->second.tex);

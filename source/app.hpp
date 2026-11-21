@@ -106,6 +106,7 @@ private:
     void syncEntries();
     void drawToasts();
     void drawPerfOverlay(float dt);
+    double cpuMs_ = 0;  // main-thread CPU work per frame (excludes vsync wait / sleep)
 
     SDL_Window* window_ = nullptr;
     SDL_Renderer* renderer_ = nullptr;

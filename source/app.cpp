@@ -192,6 +192,10 @@ void App::run() {
             for (size_t i = first; i < stack_.size(); i++) stack_[i]->render();
             drawToasts();
             if (store::settings().perfOverlay) drawPerfOverlay(dt);
+            // CPU work this frame = everything up to the present; the present then
+            // blocks on vsync (not counted). High fps + low cpu ms = we're vsync-bound,
+            // not compute-bound.
+            cpuMs_ = (gfx::now() - t) * 1000.0;
             SDL_RenderPresent(renderer_);
         }
         gfx::endFrame();
@@ -291,7 +295,7 @@ void App::drawPerfOverlay(float dt) {
         evAcc = 0;
     }
     char l1[96], l2[96], l3[96];
-    snprintf(l1, sizeof l1, "%.0f fps   frame %.1f ms (worst %.0f)", fps, dt * 1000, shownWorst * 1000);
+    snprintf(l1, sizeof l1, "%.0f fps  frame %.1f ms  cpu %.1f ms (worst %.0f)", fps, dt * 1000, cpuMs_, shownWorst * 1000);
     snprintf(l2, sizeof l2, "img ready %d/%d  %.0f MB  pending %d  up/f %d", ready, total, mb, pending, up);
     snprintf(l3, sizeof l3, "MISS/f %d   evict/s %d", miss, evictPerSec);
     float w = 430, x = W - w - 12, y = 70;
