@@ -2,6 +2,47 @@
 
 All notable changes to NuvioNX are documented here.
 
+## [0.1.5] - 2026-11-21
+
+Playback is now spread across the Switch's CPU cores, pacing is vsync-locked and smooth, and
+buffering a seek no longer pegs a single core. (Includes everything from 0.1.3 and 0.1.4, which
+were never published to GitHub — if you're updating from 0.1.2 see the note at the bottom.)
+
+### Added
+- **Multithreaded GPU video rendering.** A dedicated thread now owns mpv's OpenGL context and
+  renders each video frame into off-screen textures on its own CPU core; the main thread only
+  composites the finished frame and draws the UI. The per-frame upload/convert no longer competes
+  with input, UI and present on one core. Falls back to the single-thread GPU path, then the
+  software path, if the off-screen targets can't be created.
+- **Parallel segmented buffering.** On a fast connection, seeking to an unbuffered spot used to
+  pour the whole read-ahead burst through one relay connection on a single core (TLS + copies).
+  For progressive files the relay now pulls the byte range in 2 MiB chunks over two parallel
+  connections and forwards them to the player in order, spreading the burst across cores. Capped
+  at two connections to stay within the console's SSL-session budget; HLS, bounded ranges and
+  range-less origins keep the single-stream path.
+- **Async GPU texture upload (`opengl-pbo`).** Each decoded frame is uploaded to the GPU through
+  an asynchronous pixel buffer (DMA) instead of a blocking CPU copy.
+- **CPU-work readout in the perf overlay** (toggle with `ZL`+`ZR`): a true per-frame CPU time,
+  separate from the vsync-padded wall-clock frame time, so compute-bound and vsync-bound frames
+  can be told apart.
+
+### Changed
+- **Smooth, power-saving frame pacing during playback ("movie mode").** Steady playback is now
+  paced by the GPU swap interval at a hardware-locked **30 fps** (even divisor of the panel's
+  60 Hz, so motion stays smooth and the SoC stays cool/quiet); the instant the controls appear or
+  you interact, it snaps to **60 fps**. High-frame-rate content (48/50/60) always runs at 60.
+- **Lower CPU while browsing menus.** Ellipsised labels (card titles, rows) were re-measured with
+  the font engine every frame; the result is now cached per label, so the measuring happens once
+  instead of on every frame on the one UI core.
+- **Hardware decode requests `nvtegra-copy` directly.** Verified against the bundled mpv/ffmpeg
+  that true zero-copy (`nvtegra`) has no GL-interop in this build and always fell back to the copy
+  path, so the dead probe was removed.
+
+### Fixed
+- **Frame pacing halving.** The earlier movie-mode cap slept to hit the target rate *and* waited
+  on vsync; the two fought and halved the rate (a 30 fps target played at 15). Pacing is now done
+  purely with the vsync swap interval.
+
 ## [0.1.4] - 2026-11-21
 
 ### Added
