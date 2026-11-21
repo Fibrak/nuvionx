@@ -205,11 +205,15 @@ public:
     // controls/menus are visible, so scrubbing and overlay animations stay smooth.
     double frameCap() const override {
         if (!loaded_ || buffering_ || paused_ || menu_ != None || now() < overlayUntil_)
-            return 0.0;  // responsive: full rate
-        double f = videoFps_;
-        if (f < 5.0) f = 24.0;   // unknown yet -> assume film rate
-        if (f > 59.0) return 0.0;  // high-fps content: just run full rate
-        return f + 0.5;          // tiny margin so the display is never starved of a frame
+            return 0.0;  // interacting / controls visible: full 60 fps
+        // Steady playback: cap to 30 fps. The panel is a fixed 60 Hz, and only rates that
+        // divide 60 evenly (60/30/20/15) present on consistent vblanks. A literal 24 cap can't
+        // align to 60 Hz - it oscillates between the 2nd and 3rd vblank (20<->30) and reads as
+        // a hard stutter. 30 is the lowest clean divisor, so motion stays smooth while we still
+        // halve the per-frame present/UI work for a cooler, quieter idle. High-frame-rate
+        // content (48/50/60) just runs at full 60.
+        if (videoFps_ > 32.0) return 0.0;
+        return 30.0;
     }
 
 private:
