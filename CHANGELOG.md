@@ -4,6 +4,12 @@ All notable changes to NuvioNX are documented here.
 
 ## [0.1.4] - 2026-11-21
 
+### Changed
+- **Lower power use when idle.** The UI now drops to 30 fps after ~2 s with no input or
+  background activity, and 15 fps after ~10 s, instead of always rendering at 60. Any
+  input, background result, or toast snaps it back to 60 fps instantly; video playback is
+  never throttled. Saves battery and heat while browsing menus.
+
 ### Added
 - **GPU video rendering (experimental)** — Settings → *GPU video*. Renders video
   through mpv's OpenGL path so the Tegra GPU does the YUV→RGB convert and scaling

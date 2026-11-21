@@ -122,6 +122,7 @@ bool App::init() {
 
 void App::run() {
     double last = 0;
+    double lastActive = gfx::now();  // last time something changed (input, background result, toast)
     while (!quit_ && appletMainLoop()) {
         gfx::beginFrame();
         double t = gfx::now();
@@ -129,6 +130,7 @@ void App::run() {
         last = t;
 
         input::update();
+        bool activity = input::any() || input::touching();
         store::tick();  // batched SD writes (at most every 5 min)
         {
             // HOME button / sleep: write pending data now, the app may be closed from there
@@ -142,7 +144,7 @@ void App::run() {
             float tx, ty;
             if (input::tapped(&tx, &ty)) ui::dispatchTap(tx, ty);
         }
-        net::pumpMain();
+        if (net::pumpMain() > 0) activity = true;  // a background result arrived -> likely a visual change
         for (auto& u : lan::takeSubmitted()) installAddon(u);
         {
             std::string cu, ck;
@@ -190,9 +192,18 @@ void App::run() {
         SDL_RenderPresent(renderer_);
         gfx::endFrame();
 
-        // Hard cap at 60 fps. Vsync normally paces us, but this guarantees we never run
-        // (or spin) above 60 even if a frame presents without blocking.
-        const double kFrame = 1.0 / 60.0;
+        // Frame-rate cap. Normally 60 (vsync), but when the UI is idle - no input, no
+        // background results, no toasts, and the top screen doesn't need video frames - drop
+        // the rate so the SoC/GPU can idle, saving power and heat. Any activity snaps back to
+        // 60 instantly (input is still polled every loop, so response stays quick).
+        if (activity || !toasts_.empty()) lastActive = t;
+        bool maxFps = stack_.empty() || stack_.back()->wantsMaxFps();
+        double sinceActive = t - lastActive;
+        double kFrame = 1.0 / 60.0;
+        if (!maxFps) {
+            if (sinceActive > 10.0) kFrame = 1.0 / 15.0;      // deep idle
+            else if (sinceActive > 2.0) kFrame = 1.0 / 30.0;  // idle
+        }
         double spent = gfx::now() - t;
         if (spent < kFrame) svcSleepThread((u64)((kFrame - spent) * 1e9));
     }

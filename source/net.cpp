@@ -266,17 +266,22 @@ void postMain(std::function<void()> fn) {
     g_mainQueue.push_back(std::move(fn));
 }
 
-void pumpMain(int maxTasks) {
+int pumpMain(int maxTasks) {
+    int ran = 0;
     for (int i = 0; i < maxTasks; i++) {
         std::function<void()> fn;
         {
             std::lock_guard<std::mutex> lk(g_mainMutex);
-            if (g_mainQueue.empty()) return;
+            if (g_mainQueue.empty()) return ran;
             fn = std::move(g_mainQueue.front());
             g_mainQueue.pop_front();
         }
-        if (fn) fn();
+        if (fn) {
+            fn();
+            ran++;
+        }
     }
+    return ran;
 }
 
 std::string localIp() {

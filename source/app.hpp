@@ -17,6 +17,9 @@ public:
     virtual void render() = 0;
     virtual void onResume() {}             // became the top screen again
     virtual bool opaque() const { return true; }
+    // True if this screen must redraw every vsync (e.g. video). When false and the UI is
+    // idle, the main loop throttles the frame rate to save power.
+    virtual bool wantsMaxFps() const { return false; }
 
 protected:
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);

@@ -40,7 +40,7 @@ std::string urlDecode(const std::string& s);  // '+' -> space
 void runAsync(std::function<void()> fn);
 // Queue a function to run on the main thread (inside pumpMain).
 void postMain(std::function<void()> fn);
-void pumpMain(int maxTasks = 64);
+int pumpMain(int maxTasks = 64);  // returns how many queued tasks ran
 
 std::string localIp();
 

@@ -179,6 +179,9 @@ public:
         if (menu_ == Info) renderInfo();
     }
 
+    // Video needs a fresh frame every vsync, so never throttle the player.
+    bool wantsMaxFps() const override { return true; }
+
 private:
     enum Menu { None, Subs, Audio, Info };
     struct Item {
