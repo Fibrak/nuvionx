@@ -206,13 +206,13 @@ private:
         // (no msg-level filter: we capture mpv's messages ourselves via the client log)
         mpv_set_option_string(mpv_, "input-default-bindings", "no");
         mpv_set_option_string(mpv_, "osc", "no");
-        // Tegra hardware decoding (FFmpeg nvtegra), copied back to system memory because
-        // we render through mpv's software renderer. Falls back to CPU decoding per file.
-        // With the GPU (OpenGL) renderer, try true zero-copy decoding first: the hardware
-        // decoder's frame is imported straight into GL instead of being copied out to system
-        // RAM and re-uploaded. Falls back to the copy path (nvtegra-copy) if the interop isn't
-        // available. The software renderer needs the frame in RAM, so it always uses copy.
-        const char* hw = !st.hwdec ? "no" : (st.gpuVideo ? "nvtegra,nvtegra-copy" : "nvtegra-copy");
+        // Tegra hardware decoding (FFmpeg nvtegra): NVDEC decodes on dedicated hardware, then
+        // the frame is copied into system RAM so mpv can render it. True zero-copy (plain
+        // "nvtegra", importing the decoder surface straight into GL) is NOT possible with this
+        // mpv/ffmpeg build: libmpv ships no Tegra/dmabuf GL-interop driver and ffmpeg's nvtegra
+        // doesn't export DRM_PRIME, so "nvtegra" always falls back to "nvtegra-copy". We request
+        // the copy path directly to skip that dead probe. Falls back to CPU decoding per file.
+        const char* hw = !st.hwdec ? "no" : "nvtegra-copy";
         mpv_set_option_string(mpv_, "hwdec", hw);
         mpv_set_option_string(mpv_, "hwdec-codecs", "h264,hevc,vp9,vp8,mpeg2video,mpeg4,vc1");
         // Audio: native Switch renderer first, SDL as fallback; the console output is
