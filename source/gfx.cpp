@@ -708,6 +708,13 @@ bool imageFailed(const std::string& url) {
     return it != g_imgs.end() && it->second.st == Failed;
 }
 
+bool imageReady(const std::string& url) {
+    if (url.empty()) return false;
+    std::lock_guard<std::mutex> lk(g_imgMutex);
+    auto it = g_imgs.find(url);
+    return it != g_imgs.end() && it->second.st == Ready;
+}
+
 void drawCover(SDL_Texture* t, float x, float y, float w, float h, float rad, Uint8 alpha) {
     if (!t || w <= 0 || h <= 0) return;
     int tw, th;
@@ -809,7 +816,9 @@ bool init(SDL_Renderer* r, int pixelW, int pixelH) {
 
     trimDiskCache();
     g_imgStop = false;
-    for (int i = 0; i < 3; i++) g_imgThreads.emplace_back(imageWorker);
+    // More decode/download workers fill the poster grid faster. Kept within the socket
+    // budget (5 here + 4 in the net API pool = 9, under num_bsd_sessions = 12).
+    for (int i = 0; i < 5; i++) g_imgThreads.emplace_back(imageWorker);
     return true;
 }
 

@@ -13,6 +13,7 @@ struct Settings {
     std::string audioLang = "";    // "" = file default
     bool render1080 = false;       // render video at 1080p (heavier on CPU)
     bool showUnsupported = true;   // list torrent/YouTube streams (greyed out)
+    bool hide4k = false;           // hide streams above 1080p (4K/UHD/1440p) from sources
     bool autoplayNext = true;
     bool hwdec = true;
     bool lanServer = true;

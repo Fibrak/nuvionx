@@ -66,6 +66,8 @@ const void* fontData(size_t* size);
 // Returns nullptr until ready. maxW/maxH bound the decoded size in pixels.
 SDL_Texture* image(const std::string& url, int maxW = 600, int maxH = 900);
 bool imageFailed(const std::string& url);
+// True once the artwork has been decoded and uploaded (its texture is drawable).
+bool imageReady(const std::string& url);
 // Upper bound for decoded artwork kept in GPU memory.
 void setImageBudget(size_t bytes);
 // Free all cached artwork textures (e.g. before video playback, to give mpv the RAM).

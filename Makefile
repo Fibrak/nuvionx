@@ -13,7 +13,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 
 APP_TITLE   := NuvioNX
 APP_AUTHOR  := NuvioNX contributors (port of NuvioTV)
-APP_VERSION := 0.1.1
+APP_VERSION := 0.1.2
 
 TARGET   := nuvionx
 BUILD    := build
@@ -29,6 +29,8 @@ PKGS := SDL2_ttf SDL2_image sdl2 mpv libcurl
 
 #---------------------------------------------------------------------------------
 ARCH     := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+
+DEFINES  := -DAPP_VERSION=\"$(APP_VERSION)\"
 
 CFLAGS   := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES)
 CFLAGS   += $(INCLUDE) -D__SWITCH__ $(shell $(PREFIX)pkg-config --cflags $(PKGS))

@@ -1,6 +1,7 @@
 // Home: hero for the focused title + Continue Watching + addon catalog rows.
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <set>
 
 #include "input.hpp"
@@ -70,24 +71,34 @@ public:
     void render() override {
         const Theme& t = theme();
         float dt = 1.f / 60.f;
-        backdrop_.render(dt);
 
         auto* f = rows_.focused();
         auto* fr = rows_.focusedRow();
-        if (f) renderHero(*f, fr && fr->landscape);
+        // The hero backdrop + logo belong to the focused entry; hold them back until that
+        // entry is fully revealed (its card popped in), so the top doesn't show artwork
+        // for a card that hasn't appeared yet. Once ready, the backdrop fades itself in.
+        bool firstReady = f && rows_.focusedAppear() >= 1.f;
+        if (firstReady) {
+            backdrop_.render(dt);
+            renderHero(*f, fr && fr->landscape);
+        }
+        updateLoading(dt, firstReady);
 
         if (!rows_.hasVisible()) {
-            if (App::get().manifestsLoading() > 0 || rows_.anyLoading()) {
-                spinner(W / 2, 400, 22, t.text2);
-                text("Loading catalogs...", W / 2, 440, 18, t.text2, false, Center);
-            } else {
+            // While catalogs load, the animated "Loading..." (renderLoading) stands in.
+            renderLoading();
+            if (!(App::get().manifestsLoading() > 0 || rows_.anyLoading())) {
                 text("Nothing to show yet", W / 2, 330, 26, t.text, true, Center);
                 text("Install an addon with catalogs in the Addons tab (press R).", W / 2, 372, 18, t.text2,
                      false, Center);
             }
             return;
         }
+        // Hide the top row's "Continue Watching" header while loading; the wave sits in its
+        // place and the real title appears once the first entry is ready.
+        rows_.suppressFocusedTitle = loadAlpha_ > 0.05f;
         rows_.render(372, 650);
+        renderLoading();  // over the (now title-less) header slot
     }
 
     std::vector<ui::Hint> hints() override {
@@ -178,6 +189,7 @@ private:
         cw.title = "Continue Watching";
         cw.landscape = true;
         cw.loading = false;
+        cw.deferUntilReady = true;  // each card pops in only once its artwork is ready
         rows_.rows.push_back(cw);
         refreshContinue();
 
@@ -234,12 +246,41 @@ private:
             });
     }
 
+    // Animated "Loading..." shown (in the accent colour, letters bobbing in a wave) while
+    // the top is coming in and the first entry/hero isn't ready yet. Fades in after the top
+    // bar, fades out once the first entry is displayed, then never returns this session.
+    void updateLoading(float dt, bool firstReady) {
+        if (firstShow_ <= 0) firstShow_ = now();
+        if (firstReady) doneLoading_ = true;
+        bool want = !doneLoading_ && now() - firstShow_ > 0.35;  // let the top bar settle first
+        loadAlpha_ = ui::approach(loadAlpha_, want ? 1.f : 0.f, dt, 7.f);
+    }
+    // Drawn in the Continue Watching header's place while the first entry loads: "Loading..."
+    // in the accent colour, each letter bobbing up and down to form a travelling wave.
+    void renderLoading() {
+        if (loadAlpha_ <= 0.01f) return;
+        const Theme& t = theme();
+        const std::string s = "Loading...";
+        const int size = 20;        // matches the row title
+        float x = 48, baseY = 372;  // exactly where the "Continue Watching" title sits
+        double tt = now();
+        Col c = withA(t.accent, (Uint8)(255 * loadAlpha_));
+        for (size_t i = 0; i < s.size(); i++) {
+            float dy = std::sin((float)(tt * 6.0 - (double)i * 0.55)) * 6.f;
+            text(std::string(1, s[i]), x, baseY + dy, size, c, true, Left);
+            x += textWidth(std::string(1, s[i]), size, true);
+        }
+    }
+
     ui::RowsView rows_;
     ui::Backdrop backdrop_;
     int builtRev_ = -1;
     int gen_ = 0;
     int progRev_ = -1;
     double lastEnrich_ = -10;
+    double firstShow_ = 0;
+    float loadAlpha_ = 0;
+    bool doneLoading_ = false;
 };
 
 }  // namespace

@@ -1,10 +1,12 @@
-// Settings: theme, languages, playback options, LAN server, history.
+// Settings: theme, languages, playback options, LAN server, history, self-update.
 #include <algorithm>
+#include <utility>
 
 #include "input.hpp"
 #include "lan.hpp"
 #include "screens.hpp"
 #include "store.hpp"
+#include "update.hpp"
 
 using namespace gfx;
 
@@ -44,9 +46,9 @@ public:
         if (input::pressed(input::Right) || input::pressed(input::A)) d = 1;
         if (input::pressed(input::Left)) d = -1;
         if (d) change(d, input::pressed(input::A));
-        if (sel_ >= 10 && sel_ <= 12 && input::pressed(input::X)) {
+        if (sel_ >= 11 && sel_ <= 13 && input::pressed(input::X)) {
             auto& s = store::settings();
-            (sel_ == 10 ? s.realDebridKey : sel_ == 11 ? s.torboxKey : s.premiumizeKey).clear();
+            (sel_ == 11 ? s.realDebridKey : sel_ == 12 ? s.torboxKey : s.premiumizeKey).clear();
             store::saveSettings();
             App::get().toast("Key removed");
         }
@@ -71,18 +73,18 @@ public:
                 if (hb > hy) {
                     ui::hit(x, hy, w / 2, hb - hy, [this, ri] {
                         sel_ = ri;
-                        input::inject(ri <= 9 ? input::Left : input::A);
+                        input::inject(ri <= 10 ? input::Left : input::A);
                     });
                     ui::hit(x + w / 2, hy, w / 2, hb - hy, [this, ri] {
                         sel_ = ri;
-                        input::inject(ri <= 9 ? input::Right : input::A);
+                        input::inject(ri <= 10 ? input::Right : input::A);
                     });
                 }
             }
             text(label(i), x + 22, y + 15, 18, t.text, true);
             std::string v = value(i);
             if (!v.empty()) {
-                bool cyc = i <= 9;
+                bool cyc = i <= 10;
                 text(cyc ? "<  " + v + "  >" : v, x + w - 22, y + 15, 17, f ? t.text : t.text2, f, Right);
             }
         }
@@ -90,14 +92,23 @@ public:
     }
 
     std::vector<ui::Hint> hints() override {
-        if (sel_ >= 10 && sel_ <= 12) return {{"A", "Edit"}, {"X", "Remove"}};
-        if (sel_ == 13) return {{"A", confirm_ && now() < confirmUntil_ ? "Press again to clear" : "Clear"}};
-        if (sel_ >= 14) return {};
+        if (sel_ >= 11 && sel_ <= 13) return {{"A", "Edit"}, {"X", "Remove"}};
+        if (sel_ == 14) {
+            switch (upd_) {
+                case UpdState::Available: return {{"A", "Download & install"}};
+                case UpdState::Done: return {{"A", "Restart"}};
+                case UpdState::Checking:
+                case UpdState::Downloading: return {};
+                default: return {{"A", "Check for updates"}};
+            }
+        }
+        if (sel_ == 15) return {{"A", confirm_ && now() < confirmUntil_ ? "Press again to clear" : "Clear"}};
+        if (sel_ >= 16) return {};
         return {{"<>", "Change"}};
     }
 
 private:
-    static const int kCount = 15;
+    static const int kCount = 17;
 
     static std::string masked(const std::string& k) {
         if (k.empty()) return "Not set";
@@ -114,14 +125,18 @@ private:
             case 4: return "Hardware decoding";
             case 5: return "Video render resolution";
             case 6: return "Show unsupported streams";
-            case 7: return "Phone addon install (LAN)";
-            case 8: return "Cache artwork on SD card";
-            case 9: return "CPU boost during playback";
-            case 10: return "Real-Debrid API key";
-            case 11: return "TorBox API key";
-            case 12: return "Premiumize API key";
-            case 13: return "Clear watch history";
-            default: return "NuvioNX 0.1.1  -  unofficial Switch port of NuvioTV (GPL-3.0)";
+            case 7: return "Hide 4K / above-1080p streams";
+            case 8: return "Phone addon install (LAN)";
+            case 9: return "Cache artwork on SD card";
+            case 10: return "CPU boost during playback";
+            case 11: return "Real-Debrid API key";
+            case 12: return "TorBox API key";
+            case 13: return "Premiumize API key";
+            case 14: return "Software update";
+            case 15: return "Clear watch history";
+            default:
+                return std::string("NuvioNX ") + update::currentVersion() +
+                       "  -  unofficial Switch port of NuvioTV (GPL-3.0)";
         }
     }
 
@@ -136,18 +151,32 @@ private:
             case 4: return onoff(s.hwdec);
             case 5: return s.render1080 ? "1080p (sharper, more CPU)" : "720p (smoother)";
             case 6: return onoff(s.showUnsupported);
-            case 7: {
+            case 7: return s.hide4k ? "On (1080p and below)" : "Off (show all)";
+            case 8: {
                 if (!s.lanServer) return "Off";
                 std::string u = App::get().lanUrl();
                 return u.empty() ? "On" : u;
             }
-            case 8: return s.diskImageCache ? "On (faster, writes to SD)" : "Off (RAM only)";
-            case 9: return s.cpuBoost ? "On (1785 MHz, smoother)" : "Off";
-            case 10: return masked(s.realDebridKey);
-            case 11: return masked(s.torboxKey);
-            case 12: return masked(s.premiumizeKey);
-            case 13: return std::to_string(store::continueWatching(1000).size()) + " in progress";
+            case 9: return s.diskImageCache ? "On (faster, writes to SD)" : "Off (RAM only)";
+            case 10: return s.cpuBoost ? "On (1785 MHz, smoother)" : "Off";
+            case 11: return masked(s.realDebridKey);
+            case 12: return masked(s.torboxKey);
+            case 13: return masked(s.premiumizeKey);
+            case 14: return updateValue();
+            case 15: return std::to_string(store::continueWatching(1000).size()) + " in progress";
             default: return "";
+        }
+    }
+
+    std::string updateValue() const {
+        switch (upd_) {
+            case UpdState::Checking: return "Checking...";
+            case UpdState::UpToDate: return std::string("Up to date (v") + update::currentVersion() + ")";
+            case UpdState::Available: return "v" + updVersion_ + " available";
+            case UpdState::Downloading: return "Downloading... please wait";
+            case UpdState::Done: return "Installed - press A to restart";
+            case UpdState::Failed: return updMsg_.empty() ? "Check failed" : updMsg_;
+            default: return std::string("v") + update::currentVersion();
         }
     }
 
@@ -165,7 +194,8 @@ private:
             case 4: s.hwdec = !s.hwdec; break;
             case 5: s.render1080 = !s.render1080; break;
             case 6: s.showUnsupported = !s.showUnsupported; break;
-            case 7:
+            case 7: s.hide4k = !s.hide4k; break;
+            case 8:
                 s.lanServer = !s.lanServer;
                 if (s.lanServer) {
                     if (!lan::start(8080)) App::get().toast("Couldn't start the LAN server");
@@ -173,19 +203,23 @@ private:
                     lan::stop();
                 }
                 break;
-            case 8: s.diskImageCache = !s.diskImageCache; break;
-            case 9: s.cpuBoost = !s.cpuBoost; break;
-            case 10:
+            case 9: s.diskImageCache = !s.diskImageCache; break;
+            case 10: s.cpuBoost = !s.cpuBoost; break;
             case 11:
-            case 12: {
+            case 12:
+            case 13: {
                 if (!viaA) return;
-                std::string* key = sel_ == 10 ? &s.realDebridKey : sel_ == 11 ? &s.torboxKey : &s.premiumizeKey;
+                std::string* key = sel_ == 11 ? &s.realDebridKey : sel_ == 12 ? &s.torboxKey : &s.premiumizeKey;
                 std::string v;
                 if (!ui::keyboard(label(sel_), *key, v, true)) return;  // cancelled: keep the old key
                 *key = v;
                 break;
             }
-            case 13:
+            case 14:
+                if (!viaA) return;
+                doUpdateAction();
+                return;
+            case 15:
                 if (!viaA) return;
                 if (confirm_ && now() < confirmUntil_) {
                     store::clearProgress();
@@ -201,10 +235,74 @@ private:
         store::saveSettings();
     }
 
+    // Drive the self-update state machine on each A press of the update row.
+    void doUpdateAction() {
+        switch (upd_) {
+            case UpdState::Idle:
+            case UpdState::UpToDate:
+            case UpdState::Failed:
+                upd_ = UpdState::Checking;
+                updMsg_.clear();
+                async([] { return update::check(); },
+                      [this](update::Info& r) {
+                          if (!r.ok) {
+                              upd_ = UpdState::Failed;
+                              updMsg_ = r.error;
+                              App::get().toast(r.error);
+                          } else if (r.available) {
+                              upd_ = UpdState::Available;
+                              updVersion_ = r.version;
+                              updUrl_ = r.url;
+                              App::get().toast("Update available: v" + r.version);
+                          } else {
+                              upd_ = UpdState::UpToDate;
+                              App::get().toast("You're on the latest version");
+                          }
+                      });
+                break;
+            case UpdState::Available: {
+                upd_ = UpdState::Downloading;
+                std::string url = updUrl_;
+                async(
+                    [url] {
+                        std::string err;
+                        bool ok = update::download(url, err);
+                        return std::make_pair(ok, err);
+                    },
+                    [this](std::pair<bool, std::string>& r) {
+                        if (r.first) {
+                            upd_ = UpdState::Done;
+                            App::get().toast(update::canRelaunch() ? "Update installed - press A to restart"
+                                                                   : "Update installed - reopen NuvioNX");
+                        } else {
+                            upd_ = UpdState::Failed;
+                            updMsg_ = r.second;
+                            App::get().toast(r.second);
+                        }
+                    });
+                break;
+            }
+            case UpdState::Done:
+                if (update::canRelaunch()) {
+                    update::relaunchOnExit();
+                    App::get().requestQuit();
+                } else {
+                    App::get().toast("Please close and reopen NuvioNX to finish updating");
+                }
+                break;
+            default:
+                break;  // Checking / Downloading: ignore further presses
+        }
+    }
+
+    enum class UpdState { Idle, Checking, UpToDate, Available, Downloading, Done, Failed };
+
     int sel_ = 0;
     float scroll_ = 0;
     bool confirm_ = false;
     double confirmUntil_ = 0;
+    UpdState upd_ = UpdState::Idle;
+    std::string updVersion_, updUrl_, updMsg_;
 };
 
 }  // namespace

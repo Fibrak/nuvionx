@@ -181,6 +181,7 @@ private:
             r.loading = false;
             for (auto& m : lib)
                 if ((m.type.empty() ? "other" : m.type) == order[k]) r.items.push_back(m);
+            // same pop-in as the home rows; plays once (reveal times persist per item id)
             r.tag = std::to_string(r.items.size()) + " titles";
             if (k < cols.size()) r.col = cols[k];
             rows_.rows.push_back(r);

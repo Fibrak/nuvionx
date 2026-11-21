@@ -66,32 +66,48 @@ public:
 
         // top bar
         vGradient(0, 0, W, 90, withA(t.bg, 235), withA(t.bg, 0));
+        // Intro: on first open the logo, then each tab, then the clock/battery ease in one
+        // after another (fade + a small drop). Plays once; after ~1s every amount is 1.
+        if (introStart_ <= 0) introStart_ = now();
+        auto iAmt = [&](int order) -> float {
+            float p = (float)((now() - introStart_ - order * 0.09) / 0.34);
+            if (p <= 0.f) return 0.f;
+            if (p >= 1.f) return 1.f;
+            return 1.f - (1.f - p) * (1.f - p);  // ease-out
+        };
+        auto fade = [](Col c, float a) { return withA(c, (Uint8)(c.a * a)); };
+
         float x = 48;
-        text("NUVIO", x, 22, 24, t.text, true);
-        text("NX", x + textWidth("NUVIO", 24, true) + 6, 22, 24, t.accent, true);
+        {
+            float a0 = iAmt(0), dy = (1.f - a0) * -8.f;
+            text("NUVIO", x, 22 + dy, 24, fade(t.text, a0), true);
+            text("NX", x + textWidth("NUVIO", 24, true) + 6, 22 + dy, 24, fade(t.accent, a0), true);
+        }
 
         float tx = 230;
         for (size_t i = 0; i < names_.size(); i++) {
             bool sel = (int)i == tab_;
             float w = textWidth(names_[i], 18, true) + 30;
+            float ia = iAmt((int)i + 1), dy = (1.f - ia) * -8.f;
             if (onTabs_ && sel) {
-                roundRect(tx, 18, w, 36, 18, t.text);
-                text(names_[i], tx + w / 2, 25, 18, t.bg, true, Center);
+                roundRect(tx, 18 + dy, w, 36, 18, fade(t.text, ia));
+                text(names_[i], tx + w / 2, 25 + dy, 18, fade(t.bg, ia), true, Center);
             } else {
-                text(names_[i], tx + w / 2, 25, 18, sel ? t.text : t.text3, true, Center);
-                if (sel) roundRect(tx + w / 2 - 10, 50, 20, 3, 1.5f, t.accent);
+                text(names_[i], tx + w / 2, 25 + dy, 18, fade(sel ? t.text : t.text3, ia), true, Center);
+                if (sel) roundRect(tx + w / 2 - 10, 50 + dy, 20, 3, 1.5f, fade(t.accent, ia));
             }
             int ti = (int)i;
             ui::hit(tx, 8, w, 54, [this, ti] { switchTab(ti); });
             tx += w + 6;
         }
 
+        float iBar = iAmt((int)names_.size() + 1);  // clock + battery come in last
         time_t now = time(nullptr);
         struct tm* lt = localtime(&now);
         if (lt) {
             char buf[16];
             strftime(buf, sizeof buf, "%H:%M", lt);
-            text(buf, W - 48, 25, 18, t.text2, true, Right);
+            text(buf, W - 48, 25, 18, fade(t.text2, iBar), true, Right);
         }
 
         // battery (to the left of the clock)
@@ -108,12 +124,12 @@ public:
             float yc = ty + lineHeight(18) / 2;  // text vertical centre
             float bx = right - pctW - 12 - bw, by = yc - bh / 2;
             Col level = charging ? t.accent : (batt <= 15 ? rgba(0xEF4444) : t.text2);
-            roundOutline(bx, by, bw, bh, 3, 1.5f, t.text2);
-            fillRect(bx + bw, by + 4, 2.5f, bh - 8, t.text2);  // terminal nub
+            roundOutline(bx, by, bw, bh, 3, 1.5f, fade(t.text2, iBar));
+            fillRect(bx + bw, by + 4, 2.5f, bh - 8, fade(t.text2, iBar));  // terminal nub
             float fillW = (bw - 4) * std::min(1.f, std::max(0.f, batt / 100.f));
-            roundRect(bx + 2, by + 2, fillW, bh - 4, 1.5f, level);
-            if (charging) text("+", bx + bw / 2, yc - lineHeight(15) / 2, 15, t.bg, true, Center);
-            text(pct, right, ty, 18, t.text2, true, Right);
+            roundRect(bx + 2, by + 2, fillW, bh - 4, 1.5f, fade(level, iBar));
+            if (charging) text("+", bx + bw / 2, yc - lineHeight(15) / 2, 15, fade(t.bg, iBar), true, Center);
+            text(pct, right, ty, 18, fade(t.text2, iBar), true, Right);
         }
 
         // bottom hint bar
@@ -145,6 +161,7 @@ private:
     int tab_ = 0;
     int dbgMode_ = 0;
     bool onTabs_ = false;
+    double introStart_ = 0;  // top-bar intro animation start (set on first render)
 };
 
 }  // namespace

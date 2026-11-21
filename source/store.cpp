@@ -63,6 +63,7 @@ void load() {
         g_settings.audioLang = v["audioLang"].str("");
         g_settings.render1080 = v["render1080"].boolean(false);
         g_settings.showUnsupported = v["showUnsupported"].boolean(true);
+        g_settings.hide4k = v["hide4k"].boolean(false);
         g_settings.autoplayNext = v["autoplayNext"].boolean(true);
         g_settings.hwdec = v["hwdec"].boolean(true);
         g_settings.lanServer = v["lanServer"].boolean(true);
@@ -131,6 +132,7 @@ void saveSettings() {
     o.set("audioLang", g_settings.audioLang);
     o.set("render1080", g_settings.render1080);
     o.set("showUnsupported", g_settings.showUnsupported);
+    o.set("hide4k", g_settings.hide4k);
     o.set("autoplayNext", g_settings.autoplayNext);
     o.set("hwdec", g_settings.hwdec);
     o.set("lanServer", g_settings.lanServer);

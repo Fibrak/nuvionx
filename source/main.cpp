@@ -5,6 +5,7 @@
 #include <cstdio>
 
 #include "app.hpp"
+#include "update.hpp"
 
 static void showFatal(const char* msg) {
     consoleInit(nullptr);
@@ -24,8 +25,9 @@ static void showFatal(const char* msg) {
 }
 
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
+    // hbloader passes the launched NRO's SD path as argv[0]; the self-updater
+    // writes the new build back to it and chain-reloads.
+    if (argc > 0 && argv && argv[0]) update::setSelfPath(argv[0]);
     // Applet (Album) mode has too little memory for video playback.
     bool appletMode = appletGetAppletType() != AppletType_Application &&
                       appletGetAppletType() != AppletType_SystemApplication;

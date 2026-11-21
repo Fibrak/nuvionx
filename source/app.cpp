@@ -67,7 +67,8 @@ bool App::init() {
             memoryMB_ = (int)(total / (1024 * 1024));
     }
     // System TLS service, used by both libcurl and FFmpeg (HTTPS streams) through libnx.
-    sslUp_ = R_SUCCEEDED(sslInitialize(0x3));
+    // 0x4 is the max; the extra session helps the parallel poster downloads.
+    sslUp_ = R_SUCCEEDED(sslInitialize(0x4));
     plUp_ = R_SUCCEEDED(plInitialize(PlServiceType_User));
     psmUp_ = R_SUCCEEDED(psmInitialize());
     store::load();
@@ -184,7 +185,14 @@ void App::run() {
 
         if (store::settings().perfOverlay) drawPerfOverlay(dt);
         SDL_RenderPresent(renderer_);
+        if (!stack_.empty()) stack_.back()->onPresented();  // vsync feedback for the player
         gfx::endFrame();
+
+        // Hard cap at 60 fps. Vsync normally paces us, but this guarantees we never run
+        // (or spin) above 60 even if a frame presents without blocking.
+        const double kFrame = 1.0 / 60.0;
+        double spent = gfx::now() - t;
+        if (spent < kFrame) svcSleepThread((u64)((kFrame - spent) * 1e9));
     }
 }
 

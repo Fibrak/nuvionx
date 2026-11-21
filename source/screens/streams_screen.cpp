@@ -1,5 +1,6 @@
 // Stream picker: queries every enabled addon with a "stream" resource in parallel.
 #include <algorithm>
+#include <cctype>
 
 #include "debrid.hpp"
 #include "input.hpp"
@@ -9,6 +10,21 @@
 using namespace gfx;
 
 namespace {
+
+// True if any of the stream's text labels advertise a resolution above 1080p
+// (4K/UHD/2160p, 8K/4320p, or 1440p). Used to optionally hide those sources.
+bool isAbove1080p(const stremio::Stream& s) {
+    std::string hay;
+    hay.reserve(s.name.size() + s.title.size() + s.description.size() + s.filename.size() + 4);
+    for (const std::string* p : {&s.name, &s.title, &s.description, &s.filename}) {
+        hay += ' ';
+        for (char c : *p) hay += (char)std::tolower((unsigned char)c);
+    }
+    static const char* kTags[] = {"2160", "4320", "4k", "8k", "uhd", "1440"};
+    for (const char* tag : kTags)
+        if (hay.find(tag) != std::string::npos) return true;
+    return false;
+}
 
 class StreamsScreen : public Screen {
 public:
@@ -176,6 +192,7 @@ private:
             if (filter_ != 0 && chipIdx != filter_) continue;
             for (size_t s = 0; s < groups_[g].streams.size(); s++) {
                 if (!showUnsupported && !debrid::canPlay(groups_[g].streams[s], st)) continue;
+                if (st.hide4k && isAbove1080p(groups_[g].streams[s])) continue;
                 out.push_back({(int)g, (int)s});
             }
         }
@@ -254,9 +271,11 @@ private:
 
     void tryAutoPlay() {
         if (!ctx_.autoPlay || autoDone_) return;
+        const store::Settings& st = store::settings();
         for (auto& g : groups_)
             for (auto& s : g.streams)
-                if (s.playable() && !ctx_.preferBinge.empty() && s.bingeGroup == ctx_.preferBinge) {
+                if (s.playable() && !ctx_.preferBinge.empty() && s.bingeGroup == ctx_.preferBinge &&
+                    !(st.hide4k && isAbove1080p(s))) {
                     autoDone_ = true;
                     play(s);
                     return;

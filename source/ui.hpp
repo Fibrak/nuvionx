@@ -2,6 +2,7 @@
 #pragma once
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gfx.hpp"
@@ -57,6 +58,7 @@ struct PosterRow {
     bool landscape = false;
     int col = 0;
     float scroll = 0;
+    bool deferUntilReady = false;  // reveal each card only once its poster is decoded (recency order)
     // paging
     stremio::Addon addon;
     stremio::CatalogDesc cat;
@@ -69,7 +71,8 @@ public:
     std::vector<PosterRow> rows;
     int row = 0;
     bool showTitles = false;
-    bool active = true;  // draws focus
+    bool active = true;             // draws focus
+    bool suppressFocusedTitle = false;  // hide the top row's title (shown by a loading overlay instead)
 
     // Returns true if focus moved. Sets hitTop when Up is pressed on the first row.
     bool handleNav(bool* hitTop = nullptr);
@@ -80,6 +83,9 @@ public:
     void ensureValidFocus();
     void update(float dt);
     void render(float top, float bottom);
+    // Reveal amount (0..1) of the currently focused card; 1 unless a deferred row is
+    // still waiting for its artwork. The hero waits on this so it tracks the first entry.
+    float focusedAppear() const { return focusedAppear_; }
 
     // Called when the focused row nears its end and can page.
     std::function<void(int rowIndex)> onNeedMore;
@@ -89,13 +95,19 @@ private:
     float rowHeight(const PosterRow& r) const;
     float vscroll_ = 0, vtarget_ = 0;
     float focusAmt_ = 1.f;        // eased focus highlight (0 just after focus jumps)
+    float focusedAppear_ = 1.f;   // reveal amount of the focused card (for the hero)
     int focusRow_ = -1, focusCol_ = -1;
+    // Per-card reveal start time, keyed by item id so it survives row rebuilds (addons
+    // loading, library refresh) - the pop-in plays once and never restarts.
+    std::unordered_map<std::string, double> revealTime_;
 };
 
 void cardSize(bool landscape, float& w, float& h);
 // focusAmt (0..1) eases the focus scale + ring in, so a card the cursor only
 // crosses for a frame during fast scrolling barely changes (no pop/flicker).
+// appear (0..1) scales + fades a card in; combined with a per-card stagger it makes
+// posters pop in one at a time when a row first appears.
 void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h, bool focused, bool landscape,
-              bool showTitle, float focusAmt = 1.f);
+              bool showTitle, float focusAmt = 1.f, float appear = 1.f);
 
 }  // namespace ui
