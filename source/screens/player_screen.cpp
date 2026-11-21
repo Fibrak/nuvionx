@@ -232,6 +232,12 @@ private:
         // saving, hard to see). Has no effect when hardware decoding is active.
         mpv_set_option_string(mpv_, "vd-lavc-skiploopfilter", "nonref");
         mpv_set_option_string(mpv_, "vd-lavc-fast", "yes");
+        // GPU path only: upload each decoded frame to the GPU through an asynchronous pixel
+        // buffer (DMA) instead of a blocking CPU copy. hwdec here is nvtegra-COPY (no zero-copy
+        // interop exists in this mpv build), so every frame is pushed GPU->RAM->GPU on the main
+        // render thread; PBO uploads move that stall off the CPU and are the lowest-risk way to
+        // cut the one pegged core during playback. No effect on the software renderer.
+        if (st.gpuVideo) mpv_set_option_string(mpv_, "opengl-pbo", "yes");
         // NOTE: video-sync=display-resample was tried here but reverted. It only works with
         // mpv_render_context_report_swap(), which mpv requires to be called from the SAME
         // thread as mpv_render_context_render(). Our renderer runs render() on a background
