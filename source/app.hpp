@@ -20,6 +20,11 @@ public:
     // True if this screen must redraw every vsync (e.g. video). When false and the UI is
     // idle, the main loop throttles the frame rate to save power.
     virtual bool wantsMaxFps() const { return false; }
+    // Explicit frames-per-second cap for this screen, or 0 for none. The player uses it for
+    // "movie mode": during steady playback it caps the loop to the video's frame rate (e.g.
+    // ~24) so we stop re-compositing the same frame 60x/s, and raises it back to 60 while the
+    // user is interacting (controls shown). Applied on top of wantsMaxFps / idle throttling.
+    virtual double frameCap() const { return 0.0; }
 
 protected:
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);

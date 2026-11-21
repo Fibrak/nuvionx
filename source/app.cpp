@@ -214,6 +214,12 @@ void App::run() {
             if (sinceActive > 10.0) kFrame = 1.0 / 15.0;      // deep idle
             else if (sinceActive > 2.0) kFrame = 1.0 / 30.0;  // idle
         }
+        // Per-screen explicit cap (player "movie mode": match the video's frame rate during
+        // steady playback). Only ever lowers the rate, never raises it past the logic above.
+        if (focused && !stack_.empty()) {
+            double cap = stack_.back()->frameCap();
+            if (cap > 0.0 && 1.0 / cap > kFrame) kFrame = 1.0 / cap;
+        }
         double spent = gfx::now() - t;
         if (spent < kFrame) svcSleepThread((u64)((kFrame - spent) * 1e9));
     }

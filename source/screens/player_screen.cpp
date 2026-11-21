@@ -179,8 +179,21 @@ public:
         if (menu_ == Info) renderInfo();
     }
 
-    // Video needs a fresh frame every vsync, so never throttle the player.
+    // Video needs a fresh frame every vsync, so never let the idle throttle kick in.
     bool wantsMaxFps() const override { return true; }
+
+    // Movie mode: during steady playback cap the loop to the video's own frame rate, so we
+    // stop re-compositing and re-presenting the same frame ~60x/s (big power saving, the main
+    // win during playback). Returns 0 (full 60 fps) whenever the user is interacting or the
+    // controls/menus are visible, so scrubbing and overlay animations stay smooth.
+    double frameCap() const override {
+        if (!loaded_ || buffering_ || paused_ || menu_ != None || now() < overlayUntil_)
+            return 0.0;  // responsive: full rate
+        double f = videoFps_;
+        if (f < 5.0) f = 24.0;   // unknown yet -> assume film rate
+        if (f > 59.0) return 0.0;  // high-fps content: just run full rate
+        return f + 0.5;          // tiny margin so the display is never starved of a frame
+    }
 
 private:
     enum Menu { None, Subs, Audio, Info };
@@ -353,6 +366,7 @@ private:
         mpv_observe_property(mpv_, 7, "current-ao", MPV_FORMAT_STRING);
         mpv_observe_property(mpv_, 8, "audio-params/channel-count", MPV_FORMAT_INT64);
         mpv_observe_property(mpv_, 9, "video-params/h", MPV_FORMAT_INT64);
+        mpv_observe_property(mpv_, 10, "container-fps", MPV_FORMAT_DOUBLE);
 
         if (!useGl_) {
             // Software path: convert into an SDL streaming texture on a background thread.
@@ -440,6 +454,10 @@ private:
                             videoH_ = *(int64_t*)p->data;
                             log("NuvioNX: video height = " + std::to_string(videoH_));
                             checkResolution();
+                            break;
+                        case 10:
+                            videoFps_ = *(double*)p->data;
+                            log("NuvioNX: container fps = " + std::to_string(videoFps_));
                             break;
                     }
                     break;
@@ -879,6 +897,7 @@ private:
     std::string lastError_;
     std::string hwdecCurrent_;
     long long videoH_ = 0;
+    double videoFps_ = 0;  // container frame rate; drives movie-mode frame cap
     bool hwdecReported_ = false;
     bool logWritten_ = false;
     mpv_handle* mpv_ = nullptr;
