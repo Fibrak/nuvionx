@@ -4,7 +4,17 @@ All notable changes to NuvioNX are documented here.
 
 ## [0.1.4] - 2026-11-21
 
+### Added
+- **Font fallback for CJK / Korean / symbols.** Text from sources that used characters the
+  standard font lacks (Chinese, Korean, many symbols) showed "tofu" boxes. The app now loads
+  the Switch's other system fonts and picks a covering font per character, compositing the
+  runs (cached, so no per-frame cost). Note: the Switch has no colour-emoji font, so genuine
+  emoji still can't render without bundling one.
+
 ### Changed
+- **Don't render while off screen.** When the HOME menu is open or the screen is dimming
+  toward sleep, the app stops drawing entirely (background work and playback state still run),
+  so the GPU/SoC can idle — cooler and less battery.
 - **Lower power use when idle.** The UI now drops to 30 fps after ~2 s with no input or
   background activity, and 15 fps after ~10 s, instead of always rendering at 60. Any
   input, background result, or toast snaps it back to 60 fps instantly; video playback is

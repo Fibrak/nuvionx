@@ -132,10 +132,10 @@ void App::run() {
         input::update();
         bool activity = input::any() || input::touching();
         store::tick();  // batched SD writes (at most every 5 min)
+        bool focused = appletGetFocusState() == AppletFocusState_InFocus;
         {
             // HOME button / sleep: write pending data now, the app may be closed from there
             static bool wasFocused = true;
-            bool focused = appletGetFocusState() == AppletFocusState_InFocus;
             if (wasFocused && !focused) store::flush();
             wasFocused = focused;
         }
@@ -183,13 +183,17 @@ void App::run() {
         if (stack_.empty()) break;
 
         ui::clearHits();
-        int first = (int)stack_.size() - 1;
-        while (first > 0 && !stack_[first]->opaque()) first--;
-        for (size_t i = first; i < stack_.size(); i++) stack_[i]->render();
-        drawToasts();
-
-        if (store::settings().perfOverlay) drawPerfOverlay(dt);
-        SDL_RenderPresent(renderer_);
+        // Skip all drawing while we're not on screen (HOME menu open, screen dimming/sleep):
+        // the GPU and SoC can idle. update()/background work above still runs so we resume
+        // instantly and keep downloads going.
+        if (focused) {
+            int first = (int)stack_.size() - 1;
+            while (first > 0 && !stack_[first]->opaque()) first--;
+            for (size_t i = first; i < stack_.size(); i++) stack_[i]->render();
+            drawToasts();
+            if (store::settings().perfOverlay) drawPerfOverlay(dt);
+            SDL_RenderPresent(renderer_);
+        }
         gfx::endFrame();
 
         // Frame-rate cap. Normally 60 (vsync), but when the UI is idle - no input, no
@@ -200,7 +204,9 @@ void App::run() {
         bool maxFps = stack_.empty() || stack_.back()->wantsMaxFps();
         double sinceActive = t - lastActive;
         double kFrame = 1.0 / 60.0;
-        if (!maxFps) {
+        if (!focused) {
+            kFrame = 1.0 / 10.0;  // off-screen: idle hard (no present to vsync-pace us)
+        } else if (!maxFps) {
             if (sinceActive > 10.0) kFrame = 1.0 / 15.0;      // deep idle
             else if (sinceActive > 2.0) kFrame = 1.0 / 30.0;  // idle
         }
