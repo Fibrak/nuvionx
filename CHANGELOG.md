@@ -17,7 +17,9 @@ All notable changes to NuvioNX are documented here.
   frames; this offloads that work to the (otherwise idle) GPU. mpv runs on its own
   GL context that shares objects with SDL's, so mpv resetting GL state to defaults
   on each frame can't corrupt the SDL-rendered UI. Off by default; falls back to the
-  software renderer automatically if a shared GL context can't be created.
+  software renderer automatically if a shared GL context can't be created. With GPU video
+  on, decoding also attempts true zero-copy (`hwdec=nvtegra`, no GPU→RAM→GPU round trip),
+  falling back to the copy path if the interop isn't available.
 
 ### Fixed
 - **Hard crash (data abort / kernel panic) after a while during playback.** The

@@ -208,7 +208,12 @@ private:
         mpv_set_option_string(mpv_, "osc", "no");
         // Tegra hardware decoding (FFmpeg nvtegra), copied back to system memory because
         // we render through mpv's software renderer. Falls back to CPU decoding per file.
-        mpv_set_option_string(mpv_, "hwdec", st.hwdec ? "nvtegra-copy" : "no");
+        // With the GPU (OpenGL) renderer, try true zero-copy decoding first: the hardware
+        // decoder's frame is imported straight into GL instead of being copied out to system
+        // RAM and re-uploaded. Falls back to the copy path (nvtegra-copy) if the interop isn't
+        // available. The software renderer needs the frame in RAM, so it always uses copy.
+        const char* hw = !st.hwdec ? "no" : (st.gpuVideo ? "nvtegra,nvtegra-copy" : "nvtegra-copy");
+        mpv_set_option_string(mpv_, "hwdec", hw);
         mpv_set_option_string(mpv_, "hwdec-codecs", "h264,hevc,vp9,vp8,mpeg2video,mpeg4,vc1");
         // Audio: native Switch renderer first, SDL as fallback; the console output is
         // stereo, so downmix 5.1/7.1 (E-AC3, DTS, TrueHD...) instead of failing.
