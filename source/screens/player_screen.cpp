@@ -5,6 +5,7 @@
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
 #include <switch.h>
+#include <SDL2/SDL_opengles2.h>
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +26,16 @@
 using namespace gfx;
 
 namespace {
+
+// GLES2 framebuffer entry points, resolved at runtime via SDL_GL_GetProcAddress so we don't
+// depend on link-time GLESv2 symbols (and get exactly the GL the SDL/mpv stack uses).
+typedef void (*PFN_glGenFramebuffers)(GLsizei, GLuint*);
+typedef void (*PFN_glBindFramebuffer)(GLenum, GLuint);
+typedef void (*PFN_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+typedef GLenum (*PFN_glCheckFramebufferStatus)(GLenum);
+typedef void (*PFN_glDeleteFramebuffers)(GLsizei, const GLuint*);
+typedef void (*PFN_glGetIntegerv)(GLenum, GLint*);
+typedef void (*PFN_glFinish)(void);
 
 bool sameLang(const std::string& a, const std::string& b) {
     if (a.empty() || b.empty()) return false;
@@ -55,7 +66,8 @@ public:
             App::get().traktScrobble("stop", ctx_.meta.id, ctx_.type, ctx_.season, ctx_.episode, pct);
         }
         saveProgress();
-        stopRenderThread();  // (software path) must finish before the render context is freed
+        stopRenderThread();   // (software path) must finish before the render context is freed
+        stopVideoGlThread();  // (threaded GPU path) joins the video thread + releases its context
         if (rctx_) {
             // free mpv's GL objects on its own context, then hand the context back to SDL
             if (useGl_ && win_ && mpvGlCtx_) SDL_GL_MakeCurrent(win_, mpvGlCtx_);
@@ -132,9 +144,14 @@ public:
         SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
         SDL_RenderClear(R);
 
-        if (useGl_) {
-            // GPU path: mpv draws the video straight onto the window framebuffer (GPU does
-            // the convert + scale). UI drawn by SDL on top afterwards.
+        if (useGl_ && glThreaded_) {
+            // Threaded GPU path: the video thread already rendered the frame into an off-screen
+            // texture on another core; here we only composite the latest finished one.
+            int idx = vpub_.load(std::memory_order_acquire);
+            if (idx >= 0 && videoTex_[idx]) SDL_RenderCopy(R, videoTex_[idx], nullptr, nullptr);
+        } else if (useGl_) {
+            // GPU path (single-thread fallback): mpv draws the video straight onto the window
+            // framebuffer (GPU does the convert + scale). UI drawn by SDL on top afterwards.
             renderVideoGl();
         } else {
             // Software path: frames are converted on a background thread; here we only upload
@@ -375,8 +392,11 @@ private:
             tex_ = SDL_CreateTexture(R, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, vw_, vh_);
             if (tex_) SDL_SetTextureBlendMode(tex_, SDL_BLENDMODE_NONE);
             startRenderThread();
+        } else {
+            // GPU path: render on a dedicated thread/core into off-screen textures. Falls back
+            // to the single-thread main-thread render (renderVideoGl) if setup fails.
+            setupVideoGlThread();
         }
-        // GPU path renders straight to the window framebuffer on the main thread (renderVideoGl).
         if (st.cpuBoost) boosted_ = R_SUCCEEDED(appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad));
 
         const store::Progress* p = store::progress(ctx_.videoId);
@@ -502,6 +522,130 @@ private:
         };
         mpv_render_context_render(rctx_, params);
         SDL_GL_MakeCurrent(win_, sdlGlCtx_);   // hand the context back to SDL for the UI
+    }
+
+    // ------------------------------------------------- threaded GPU render (dedicated core)
+    // Create two off-screen SDL target textures and hand their GL names to the video thread,
+    // which attaches them to FBOs in mpv's context and renders each frame into them on its own
+    // core. The main thread then just SDL_RenderCopy's the latest finished one. Runs on the
+    // main thread with SDL's context current. On any failure we leave glThreaded_ false and the
+    // player falls back to the single-thread renderVideoGl path.
+    void setupVideoGlThread() {
+        if (!rctx_ || !win_ || !mpvGlCtx_ || !sdlGlCtx_) return;
+        // Resolve the GLES2 framebuffer functions (SDL's GL context is current here).
+        glGenFramebuffers_ = (PFN_glGenFramebuffers)SDL_GL_GetProcAddress("glGenFramebuffers");
+        glBindFramebuffer_ = (PFN_glBindFramebuffer)SDL_GL_GetProcAddress("glBindFramebuffer");
+        glFramebufferTexture2D_ = (PFN_glFramebufferTexture2D)SDL_GL_GetProcAddress("glFramebufferTexture2D");
+        glCheckFramebufferStatus_ = (PFN_glCheckFramebufferStatus)SDL_GL_GetProcAddress("glCheckFramebufferStatus");
+        glDeleteFramebuffers_ = (PFN_glDeleteFramebuffers)SDL_GL_GetProcAddress("glDeleteFramebuffers");
+        glGetIntegerv_ = (PFN_glGetIntegerv)SDL_GL_GetProcAddress("glGetIntegerv");
+        glFinish_ = (PFN_glFinish)SDL_GL_GetProcAddress("glFinish");
+        if (!glGenFramebuffers_ || !glBindFramebuffer_ || !glFramebufferTexture2D_ ||
+            !glCheckFramebufferStatus_ || !glDeleteFramebuffers_ || !glGetIntegerv_ || !glFinish_) {
+            log("NuvioNX: GL framebuffer functions unavailable; threaded render disabled");
+            return;
+        }
+        SDL_GetRendererOutputSize(R, &vw2_, &vh2_);
+        if (vw2_ <= 0 || vh2_ <= 0) return;
+        for (int i = 0; i < 2; i++) {
+            videoTex_[i] = SDL_CreateTexture(R, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_TARGET, vw2_, vh2_);
+            if (!videoTex_[i]) { teardownVideoGl(); return; }
+            SDL_SetTextureBlendMode(videoTex_[i], SDL_BLENDMODE_NONE);
+            // Force SDL to allocate the backing GL texture at full size.
+            SDL_SetRenderTarget(R, videoTex_[i]);
+            SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
+            SDL_RenderClear(R);
+            SDL_SetRenderTarget(R, nullptr);
+            // Discover the underlying GL texture name (shared with mpv's context by name).
+            float tw = 0, th = 0;
+            if (SDL_GL_BindTexture(videoTex_[i], &tw, &th) != 0) { teardownVideoGl(); return; }
+            GLint id = 0;
+            glGetIntegerv_(GL_TEXTURE_BINDING_2D, &id);
+            SDL_GL_UnbindTexture(videoTex_[i]);
+            if (id == 0) { teardownVideoGl(); return; }
+            videoGlId_[i] = (unsigned)id;
+        }
+        SDL_RenderFlush(R);  // submit SDL's setup GL work before the thread touches the textures
+        renderRun_ = true;
+        glThreaded_ = true;
+        mpv_render_context_set_update_callback(rctx_, onMpvUpdate, this);
+        videoThread_ = std::thread([this] { videoGlLoop(); });
+        log("NuvioNX: threaded GPU render started (" + std::to_string(vw2_) + "x" + std::to_string(vh2_) + ")");
+    }
+
+    void videoGlLoop() {
+        if (SDL_GL_MakeCurrent(win_, mpvGlCtx_) != 0) {
+            log("NuvioNX: video thread couldn't bind the GL context");
+            glThreaded_ = false;
+            return;
+        }
+        glGenFramebuffers_(2, videoFbo_);
+        for (int i = 0; i < 2; i++) {
+            glBindFramebuffer_(GL_FRAMEBUFFER, videoFbo_[i]);
+            glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, videoGlId_[i], 0);
+            if (glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                log("NuvioNX: video FBO incomplete; threaded render disabled");
+                glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+                glDeleteFramebuffers_(2, videoFbo_);
+                videoFbo_[0] = videoFbo_[1] = 0;
+                SDL_GL_MakeCurrent(win_, nullptr);
+                glThreaded_ = false;  // main thread falls back to renderVideoGl
+                return;
+            }
+        }
+        glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lk(wakeMx_);
+                wakeCv_.wait_for(lk, std::chrono::milliseconds(100), [this] { return wake_ || !renderRun_; });
+                if (!renderRun_) break;
+                wake_ = false;
+            }
+            if (!(mpv_render_context_update(rctx_) & MPV_RENDER_UPDATE_FRAME)) continue;
+            int back = (vpub_.load(std::memory_order_relaxed) == 0) ? 1 : 0;  // the un-published buffer
+            mpv_opengl_fbo fbo{};
+            fbo.fbo = (int)videoFbo_[back];
+            fbo.w = vw2_;
+            fbo.h = vh2_;
+            int flip = 0;  // rendering into a texture SDL will sample top-left; no extra flip
+            mpv_render_param params[] = {
+                {MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
+                {MPV_RENDER_PARAM_FLIP_Y, &flip},
+                {MPV_RENDER_PARAM_INVALID, nullptr},
+            };
+            mpv_render_context_render(rctx_, params);
+            glFinish_();  // the main thread (other context) samples this texture; make sure it's done
+            vpub_.store(back, std::memory_order_release);
+        }
+        if (videoFbo_[0] || videoFbo_[1]) glDeleteFramebuffers_(2, videoFbo_);
+        videoFbo_[0] = videoFbo_[1] = 0;
+        SDL_GL_MakeCurrent(win_, nullptr);  // release so the main thread can free the context
+    }
+
+    void stopVideoGlThread() {
+        if (videoThread_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(wakeMx_);
+                renderRun_ = false;
+                wake_ = true;
+            }
+            wakeCv_.notify_one();
+            videoThread_.join();
+        }
+        if (rctx_ && glThreaded_) mpv_render_context_set_update_callback(rctx_, nullptr, nullptr);
+        glThreaded_ = false;
+        teardownVideoGl();
+    }
+
+    void teardownVideoGl() {
+        for (int i = 0; i < 2; i++) {
+            if (videoTex_[i]) {
+                SDL_DestroyTexture(videoTex_[i]);
+                videoTex_[i] = nullptr;
+            }
+        }
+        vpub_.store(-1);
     }
 
     // ---------------------------------------------------------- render thread (software path)
@@ -920,6 +1064,25 @@ private:
     uint8_t* frames_[2] = {nullptr, nullptr};
     std::atomic<int> front_{0};
     bool frameReady_ = false;
+
+    // Multithreaded GPU render: a dedicated thread owns mpv's GL context and renders each
+    // video frame into one of two off-screen textures (double-buffered). The main thread just
+    // SDL_RenderCopy's the latest finished one, so the heavy upload/convert runs on its own
+    // core instead of competing with input/UI/present on the main thread.
+    std::thread videoThread_;
+    SDL_Texture* videoTex_[2] = {nullptr, nullptr};  // SDL target textures mpv renders into
+    unsigned videoGlId_[2] = {0, 0};                 // their underlying GL texture names
+    unsigned videoFbo_[2] = {0, 0};                  // FBOs (live in mpv's context only)
+    std::atomic<int> vpub_{-1};                      // index of the last finished frame (-1 = none)
+    int vw2_ = 0, vh2_ = 0;                           // off-screen render size
+    bool glThreaded_ = false;                        // true once the threaded path is live
+    PFN_glGenFramebuffers glGenFramebuffers_ = nullptr;
+    PFN_glBindFramebuffer glBindFramebuffer_ = nullptr;
+    PFN_glFramebufferTexture2D glFramebufferTexture2D_ = nullptr;
+    PFN_glCheckFramebufferStatus glCheckFramebufferStatus_ = nullptr;
+    PFN_glDeleteFramebuffers glDeleteFramebuffers_ = nullptr;
+    PFN_glGetIntegerv glGetIntegerv_ = nullptr;
+    PFN_glFinish glFinish_ = nullptr;
 
     double pos_ = 0, dur_ = 0;
     bool paused_ = false, buffering_ = true, loaded_ = false, ended_ = false;
