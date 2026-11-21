@@ -16,6 +16,7 @@ public:
     virtual void update(float dt) = 0;
     virtual void render() = 0;
     virtual void onResume() {}             // became the top screen again
+    virtual void onPresented() {}          // after SDL_RenderPresent / vblank (player uses it for mpv swap timing)
     virtual bool opaque() const { return true; }
 
 protected:
