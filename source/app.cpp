@@ -185,7 +185,6 @@ void App::run() {
 
         if (store::settings().perfOverlay) drawPerfOverlay(dt);
         SDL_RenderPresent(renderer_);
-        if (!stack_.empty()) stack_.back()->onPresented();  // vsync feedback for the player
         gfx::endFrame();
 
         // Hard cap at 60 fps. Vsync normally paces us, but this guarantees we never run

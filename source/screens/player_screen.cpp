@@ -211,14 +211,12 @@ private:
         // saving, hard to see). Has no effect when hardware decoding is active.
         mpv_set_option_string(mpv_, "vd-lavc-skiploopfilter", "nonref");
         mpv_set_option_string(mpv_, "vd-lavc-fast", "yes");
-        // Smooth playback on the Switch's fixed 60 Hz display: resample the video clock to
-        // the real refresh rate (reported via mpv_render_context_report_swap after each
-        // present). This gives an even, drift-free cadence instead of frames landing at
-        // arbitrary points in the vsync cycle - the main cause of micro-judder. It doesn't
-        // raise conversion cost: each decoded frame is still rendered once, just held for a
-        // regular number of refreshes.
-        mpv_set_option_string(mpv_, "video-sync", "display-resample");
-        mpv_set_option_string(mpv_, "video-sync-max-video-change", "5");
+        // NOTE: video-sync=display-resample was tried here but reverted. It only works with
+        // mpv_render_context_report_swap(), which mpv requires to be called from the SAME
+        // thread as mpv_render_context_render(). Our renderer runs render() on a background
+        // thread while the SDL swap happens on the main thread, so reporting the swap from
+        // the main thread raced mpv's display-sync timing state and corrupted the heap
+        // (hard crash after a while in playback). Default audio sync is what we ship.
         // Drop late frames at the decoder instead of stuttering audio/video sync.
         mpv_set_option_string(mpv_, "framedrop", "decoder+vo");
         mpv_set_option_string(mpv_, "cache", "yes");
@@ -376,12 +374,6 @@ private:
                 default: break;
             }
         }
-    }
-
-    // Called by the app loop right after SDL_RenderPresent: tells mpv when the frame was
-    // actually flipped to the display, which drives display-sync timing.
-    void onPresented() override {
-        if (rctx_) mpv_render_context_report_swap(rctx_);
     }
 
     void poke() { overlayUntil_ = now() + 4.0; }

@@ -2,6 +2,17 @@
 
 All notable changes to NuvioNX are documented here.
 
+## [0.1.4] - 2026-11-21
+
+### Fixed
+- **Hard crash (data abort / kernel panic) after a while during playback.** The
+  0.1.2/0.1.3 attempt at smoother video called `mpv_render_context_report_swap()`
+  from the main thread while `mpv_render_context_render()` ran on the background
+  render thread. mpv requires both on the same thread; the race corrupted mpv's
+  display-sync state and then the heap, crashing later inside libc's number/locale
+  formatting code. Reverted to mpv's default audio sync (the pre-0.1.2 behaviour).
+  Smoothness tuning will be revisited in a way that fits the threaded renderer.
+
 ## [0.1.3] - 2026-11-21
 
 ### Fixed
