@@ -211,20 +211,12 @@ private:
         // saving, hard to see). Has no effect when hardware decoding is active.
         mpv_set_option_string(mpv_, "vd-lavc-skiploopfilter", "nonref");
         mpv_set_option_string(mpv_, "vd-lavc-fast", "yes");
-        // Smooth, judder-free playback on the Switch's fixed 60 Hz panel: resample the video
-        // clock to the real refresh rate so every frame is held for a whole number of
-        // refreshes (clean 3:2 cadence for 24p etc.) instead of landing at arbitrary points
-        // in the vsync cycle. This needs vblank feedback via mpv_render_context_report_swap()
-        // - which we call from the RENDER thread (see renderLoop), the same thread as
-        // mpv_render_context_render(), as mpv requires. (Calling it from the main thread
-        // raced mpv's timing state and corrupted the heap - the old crash.) The panel is
-        // always 60 Hz, so pin the display rate rather than trusting measured swap timing.
-        mpv_set_option_string(mpv_, "video-sync", "display-resample");
-        mpv_set_option_string(mpv_, "video-sync-max-video-change", "5");
-        mpv_set_option_string(mpv_, "display-fps-override", "60");
-        // No frame interpolation (far too heavy for a software renderer here) - resampling
-        // only changes how long each real frame is shown, it never blends frames.
-        mpv_set_option_string(mpv_, "interpolation", "no");
+        // NOTE: video-sync=display-resample was tried here but reverted. It only works with
+        // mpv_render_context_report_swap(), which mpv requires to be called from the SAME
+        // thread as mpv_render_context_render(). Our renderer runs render() on a background
+        // thread while the SDL swap happens on the main thread, so reporting the swap from
+        // the main thread raced mpv's display-sync timing state and corrupted the heap
+        // (hard crash after a while in playback). Default audio sync is what we ship.
         // Drop late frames at the decoder instead of stuttering audio/video sync.
         mpv_set_option_string(mpv_, "framedrop", "decoder+vo");
         mpv_set_option_string(mpv_, "cache", "yes");
@@ -384,19 +376,6 @@ private:
         }
     }
 
-    // Called on the MAIN thread right after SDL_RenderPresent returns (i.e. just after a
-    // real vblank, since the renderer is vsync-paced). We must NOT touch the mpv render
-    // context here - that would race the render thread. Instead flag the swap and wake the
-    // render thread, which calls mpv_render_context_report_swap() itself.
-    void onPresented() override {
-        swapPending_.store(true, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lk(wakeMx_);
-            wake_ = true;
-        }
-        wakeCv_.notify_one();
-    }
-
     void poke() { overlayUntil_ = now() + 4.0; }
 
     // Trakt scrobbling: "start" when playback (re)starts, "pause" when paused.
@@ -457,13 +436,6 @@ private:
                 if (!renderRun_) break;
                 wake_ = false;
             }
-            // Report display swaps to mpv on THIS thread (same one that calls render),
-            // which is what display-resample uses to pace frames. Collapse to one report
-            // per wake: the render thread is idle most of the time so it keeps up with the
-            // 60 Hz present loop, and reporting several at once would tell mpv that multiple
-            // vblanks happened at the same instant and skew its clock.
-            if (swapPending_.exchange(false, std::memory_order_relaxed) && rctx_)
-                mpv_render_context_report_swap(rctx_);
             if (!(mpv_render_context_update(rctx_) & MPV_RENDER_UPDATE_FRAME)) continue;
             int back = 1 - front_.load();
             int size[2] = {vw_, vh_};
@@ -828,7 +800,6 @@ private:
     std::vector<uint8_t> frameStore_[2];
     uint8_t* frames_[2] = {nullptr, nullptr};
     std::atomic<int> front_{0};
-    std::atomic<bool> swapPending_{false};  // main thread saw a vblank; render thread reports it
     bool frameReady_ = false;
 
     double pos_ = 0, dur_ = 0;
