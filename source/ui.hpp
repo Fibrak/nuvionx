@@ -82,7 +82,9 @@ public:
     bool anyLoading() const;
     void ensureValidFocus();
     void update(float dt);
-    void render(float top, float bottom);
+    // topFade > 0: rows leaving through the top dissolve over that many pixels above `top`
+    // (that strip must be free of other content) instead of being cut off at the edge.
+    void render(float top, float bottom, float topFade = 0.f);
     // Reveal amount (0..1) of the currently focused card; 1 unless a deferred row is
     // still waiting for its artwork. The hero waits on this so it tracks the first entry.
     float focusedAppear() const { return focusedAppear_; }
@@ -108,6 +110,6 @@ void cardSize(bool landscape, float& w, float& h);
 // appear (0..1) scales + fades a card in; combined with a per-card stagger it makes
 // posters pop in one at a time when a row first appears.
 void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h, bool focused, bool landscape,
-              bool showTitle, float focusAmt = 1.f, float appear = 1.f);
+              bool showTitle, float focusAmt = 1.f, float appear = 1.f, float opacity = 1.f);
 
 }  // namespace ui

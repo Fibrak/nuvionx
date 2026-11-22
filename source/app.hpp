@@ -10,6 +10,18 @@
 struct SDL_Window;
 struct SDL_Renderer;
 
+// Where one main-loop iteration spent its time (milliseconds). The gc/gap fields describe the
+// stretch between the previous present and this frame's start.
+struct FrameTiming {
+    double preMs = 0;      // input, background results, navigation
+    double updateMs = 0;   // screen update()
+    double drawMs = 0;     // screen render() + toasts/overlay
+    double workMs = 0;     // everything before the present
+    double presentMs = 0;  // blocked in SDL_RenderPresent
+    double prevGcMs = 0;   // previous frame's image/text cache cleanup
+    double prevGapMs = 0;  // rest of the previous frame's tail (swap interval, loop, preemption)
+};
+
 class Screen {
 public:
     virtual ~Screen() = default;
@@ -25,6 +37,8 @@ public:
     // ~24) so we stop re-compositing the same frame 60x/s, and raises it back to 60 while the
     // user is interacting (controls shown). Applied on top of wantsMaxFps / idle throttling.
     virtual double frameCap() const { return 0.0; }
+    // Called right after this frame's present while a playback trace is recording.
+    virtual void onPresented(const FrameTiming& timing) { (void)timing; }
 
 protected:
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
@@ -105,6 +119,8 @@ private:
     std::string traktStatus_;
     std::vector<ProfileInfo> profiles_;
     std::vector<std::string> enriched_;
+    int enrichRev_ = -1;         // progress revision of the last enrichProgress() pass
+    size_t enrichedSize_ = 0;    // enriched_.size() after that pass (detects a reset)
     App() = default;
     void loadAddons();
     void refreshManifest(const std::string& manifestUrl);

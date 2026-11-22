@@ -17,6 +17,7 @@ using namespace gfx;
 struct HitRegion {
     float x, y, w, h;
     std::function<void()> fn;
+    bool pressA;  // also press A after fn (tap-to-activate), without a second heap-allocated wrapper
 };
 static std::vector<HitRegion> g_hits, g_prevHits;
 
@@ -27,7 +28,7 @@ void clearHits() {
 
 void hit(float x, float y, float w, float h, std::function<void()> fn) {
     if (w <= 0 || h <= 0) return;
-    g_hits.push_back({x, y, w, h, std::move(fn)});
+    g_hits.push_back({x, y, w, h, std::move(fn), false});
 }
 
 bool dispatchTap(float x, float y) {
@@ -36,7 +37,9 @@ bool dispatchTap(float x, float y) {
     for (auto it = regions.rbegin(); it != regions.rend(); ++it) {
         if (x >= it->x && x < it->x + it->w && y >= it->y && y < it->y + it->h) {
             auto fn = it->fn;  // copy: the handler may trigger re-registration
-            fn();
+            bool pressA = it->pressA;
+            if (fn) fn();
+            if (pressA) input::inject(input::A);
             return true;
         }
     }
@@ -44,10 +47,8 @@ bool dispatchTap(float x, float y) {
 }
 
 void tapToActivate(float x, float y, float w, float h, std::function<void()> focus) {
-    hit(x, y, w, h, [focus]() {
-        if (focus) focus();
-        input::inject(input::A);
-    });
+    if (w <= 0 || h <= 0) return;
+    g_hits.push_back({x, y, w, h, std::move(focus), true});
 }
 
 void backButton(float x, float y) {
@@ -232,7 +233,7 @@ void cardSize(bool landscape, float& w, float& h) {
 }
 
 void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h, bool focused, bool landscape,
-              bool showTitle, float focusAmt, float appear) {
+              bool showTitle, float focusAmt, float appear, float opacity) {
     const Theme& t = theme();
     if (focused) {
         float g = 1.f + 0.05f * focusAmt;  // eased scale, not an instant 1.05 pop
@@ -252,9 +253,11 @@ void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h,
         h *= s;
     }
     // Fade a theme colour by the pop-in amount (preserving its own alpha).
-    auto A = [ap](Col c) { return withA(c, (Uint8)(c.a * ap)); };
-    std::string url = landscape ? (m.background.empty() ? m.poster : m.background) : m.poster;
+    float vis = ap * (opacity < 0.f ? 0.f : (opacity > 1.f ? 1.f : opacity));
+    auto A = [vis](Col c) { return withA(c, (Uint8)(c.a * vis)); };
+    const std::string& url = landscape ? (m.background.empty() ? m.poster : m.background) : m.poster;
     SDL_Texture* tex = image(url, landscape ? 480 : 300, landscape ? 270 : 450);
+    if (opacity <= 0.003f) return;  // fully faded: nothing to draw, but the artwork stays cached
     float rad = debugFlat() ? 0.f : 10.f;  // debug: flat (plain copy) vs rounded (geometry)
     float fade = tex ? imageFade(url) : 0.f;
     if (fade < 1.f) {
@@ -274,7 +277,7 @@ void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h,
         // with solid-colour cut-outs matching the background behind the card. The cut-outs
         // fade in with the poster: drawn opaque before the image is up, they'd stamp hard
         // background squares onto the corners (ugly black spots on the menu).
-        Uint8 cov = (Uint8)(255 * fade * ap);
+        Uint8 cov = (Uint8)(255 * fade * vis);
         drawCover(tex, x, y, w, h, 0, cov);
         if (rad > 0.5f) cornerCutouts(x, y, w, h, rad, withA(t.bg, cov));
     }
@@ -283,7 +286,7 @@ void drawCard(const stremio::MetaPreview& m, float x, float y, float w, float h,
         fillRect(x + 10, y + h - 12, (w - 20) * std::min(1.f, m.progress), 4, A(t.accent));
     }
     if (focused && focusAmt > 0.01f) {
-        Col ring = withA(t.focusRing, (Uint8)(t.focusRing.a * std::min(1.f, focusAmt) * ap));
+        Col ring = withA(t.focusRing, (Uint8)(t.focusRing.a * std::min(1.f, focusAmt) * vis));
         roundOutline(x - 4, y - 4, w + 8, h + 8, 14, 3, ring);
     }
     if (landscape) {
@@ -420,12 +423,12 @@ void RowsView::update(float dt) {
 }
 
 // The artwork URL a card draws (landscape cards prefer the backdrop).
-static std::string artUrl(const stremio::MetaPreview& m, bool landscape) {
+static const std::string& artUrl(const stremio::MetaPreview& m, bool landscape) {
     return landscape ? (m.background.empty() ? m.poster : m.background) : m.poster;
 }
 
 // Stable identity for a card, used to remember its reveal time across row rebuilds.
-static std::string itemId(const stremio::MetaPreview& m) {
+static const std::string& itemId(const stremio::MetaPreview& m) {
     return !m.videoId.empty() ? m.videoId : m.id;
 }
 
@@ -435,11 +438,21 @@ static void prefetchCard(const stremio::MetaPreview& m, bool landscape) {
     image(artUrl(m, landscape), landscape ? 480 : 300, landscape ? 270 : 450);
 }
 
-void RowsView::render(float top, float bottom) {
+void RowsView::render(float top, float bottom, float topFade) {
     const Theme& t = theme();
-    // Clip exactly to [top, bottom] - no overscan above, or a row scrolling out at the
-    // top leaks a thin sliver into the gap above the first row.
-    pushClip(0, top, W, bottom - top);
+    // Clip to [top - topFade, bottom] - no other overscan above, or a row scrolling out at
+    // the top leaks a thin sliver into the gap above the first row.
+    pushClip(0, top - topFade, W, bottom - top + topFade);
+    // Opacity of something whose top edge is at `elemY`: full at `top`, zero by the clip edge,
+    // so nothing is still visible when it reaches the line where it gets cut.
+    auto fadeAt = [top, topFade](float elemY) -> float {
+        if (topFade <= 0.f) return 1.f;
+        float k = (elemY - (top - topFade)) / topFade;
+        if (k <= 0.f) return 0.f;
+        if (k >= 1.f) return 1.f;
+        return k * k * (3.f - 2.f * k);  // smoothstep
+    };
+    auto faded = [](Col c, float a) { return withA(c, (Uint8)(c.a * a)); };
     focusedAppear_ = 1.f;  // overridden below once the focused card is drawn
     float y = top - vscroll_;
     for (size_t i = 0; i < rows.size(); i++) {
@@ -466,16 +479,19 @@ void RowsView::render(float top, float bottom) {
         }
         bool rowFocused = active && (int)i == row;
         if (!(rowFocused && suppressFocusedTitle)) {
-            float tw = text(r.title, kLeft, y, 20, rowFocused ? t.text : t.text2, true);
-            if (!r.tag.empty()) text(r.tag, kLeft + tw + 12, y + 4, 14, t.text3);
+            float titleAlpha = fadeAt(y);
+            float tw = text(r.title, kLeft, y, 20, faded(rowFocused ? t.text : t.text2, titleAlpha), true);
+            if (!r.tag.empty()) text(r.tag, kLeft + tw + 12, y + 4, 14, faded(t.text3, titleAlpha));
         }
         float cw, ch;
         cardSize(r.landscape, cw, ch);
         float cy = y + 34;
+        float cardAlpha = fadeAt(cy);
         if (r.items.empty() && r.loading) {
             float pulse = 0.5f + 0.5f * std::sin((float)now() * 4.f);
             for (int k = 0; k < 10; k++)
-                roundRect(kLeft + k * (cw + kGap), cy, cw, ch, 10, withA(t.card, (Uint8)(150 + 80 * pulse)));
+                roundRect(kLeft + k * (cw + kGap), cy, cw, ch, 10,
+                          withA(t.card, (Uint8)((150 + 80 * pulse) * cardAlpha)));
         } else {
             int first = std::max(0, (int)(r.scroll / (cw + kGap)) - 1);
             const double kPop = 0.28;      // pop-in duration (seconds)
@@ -488,14 +504,14 @@ void RowsView::render(float top, float bottom) {
                 // finished AND k's own poster is decoded. A failed image doesn't stall it.
                 double prevStart = -1e9;
                 for (int k = 0; k < (int)r.items.size(); k++) {
-                    std::string id = itemId(r.items[k]);
+                    const std::string& id = itemId(r.items[k]);
                     auto it = revealTime_.find(id);
                     if (it != revealTime_.end()) {
                         prevStart = it->second;
                         continue;
                     }
                     if (now() - prevStart < kPop) break;  // earlier card still animating
-                    std::string u = artUrl(r.items[k], r.landscape);
+                    const std::string& u = artUrl(r.items[k], r.landscape);
                     if (!imageReady(u) && !imageFailed(u)) break;  // wait for this artwork
                     revealTime_[id] = now();
                     prevStart = now();
@@ -504,7 +520,7 @@ void RowsView::render(float top, float bottom) {
                 // Gentle left-to-right stagger: schedule each on-screen card once.
                 for (int k = first; k < (int)r.items.size(); k++) {
                     if (kLeft + k * (cw + kGap) - r.scroll > W + 10) break;  // rest when scrolled to
-                    std::string id = itemId(r.items[k]);
+                    const std::string& id = itemId(r.items[k]);
                     if (!revealTime_.count(id)) revealTime_[id] = now() + (k - first) * kStagger;
                 }
             }
@@ -526,7 +542,7 @@ void RowsView::render(float top, float bottom) {
                 }
                 if (cx + cw < -20) continue;
                 bool f = rowFocused && k == r.col;
-                if (cy + ch > top - 30 && cy < bottom) {
+                if (cardAlpha > 0.05f && cy + ch > top - 30 && cy < bottom) {
                     int ri = (int)i;
                     tapToActivate(cx, cy, cw, ch, [this, ri, k] {
                         row = ri;
@@ -534,15 +550,16 @@ void RowsView::render(float top, float bottom) {
                     });
                 }
                 if (f) continue;  // draw focused last so it sits on top
-                drawCard(r.items[k], cx, cy, cw, ch, false, r.landscape, showTitles, 1.f, appearAt(k));
+                drawCard(r.items[k], cx, cy, cw, ch, false, r.landscape, showTitles, 1.f, appearAt(k), cardAlpha);
             }
             if (rowFocused && r.col < (int)r.items.size()) {
                 float cx = kLeft + r.col * (cw + kGap) - r.scroll;
-                drawCard(r.items[r.col], cx, cy, cw, ch, true, r.landscape, showTitles, focusAmt_, appearAt(r.col));
+                drawCard(r.items[r.col], cx, cy, cw, ch, true, r.landscape, showTitles, focusAmt_, appearAt(r.col),
+                         cardAlpha);
             }
             if (r.paging) {
                 float cx = kLeft + r.items.size() * (cw + kGap) - r.scroll;
-                if (cx < W) spinner(cx + cw / 2, cy + ch / 2, 14, t.text2);
+                if (cx < W) spinner(cx + cw / 2, cy + ch / 2, 14, faded(t.text2, cardAlpha));
             }
         }
         y += rh;

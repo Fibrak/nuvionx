@@ -15,6 +15,7 @@
 #include "json.hpp"
 #include "input.hpp"
 #include "lan.hpp"
+#include "playtrace.hpp"
 #include "proxy.hpp"
 #include "sdfile.hpp"
 #include "screens/screens.hpp"
@@ -124,7 +125,15 @@ void App::run() {
     double last = 0;
     double lastActive = gfx::now();  // last time something changed (input, background result, toast)
     int curSwapInterval = 1;         // GPU vsync divisor currently set (1 = 60 Hz)
+    int64_t tailStartUs = 0, gcEndUs = 0;  // previous frame: start and end of endFrame()
+    double lastStoreTick = 0;
     while (!quit_ && appletMainLoop()) {
+        int64_t frameStartUs = playtrace::nowUs();  // gfx::now() only advances once per frame
+        FrameTiming timing;
+        if (tailStartUs) {
+            timing.prevGcMs = (gcEndUs - tailStartUs) / 1000.0;
+            timing.prevGapMs = (frameStartUs - gcEndUs) / 1000.0;
+        }
         gfx::beginFrame();
         double t = gfx::now();
         float dt = (float)std::min(0.1, std::max(0.0, t - last));
@@ -132,7 +141,10 @@ void App::run() {
 
         input::update();
         bool activity = input::any() || input::touching();
-        store::tick();  // batched SD writes (at most every 5 min)
+        if (t - lastStoreTick >= 1.0) {  // batched SD writes (at most every 5 min)
+            lastStoreTick = t;
+            store::tick();
+        }
         bool focused = appletGetFocusState() == AppletFocusState_InFocus;
         {
             // HOME button / sleep: write pending data now, the app may be closed from there
@@ -146,8 +158,8 @@ void App::run() {
             if (input::tapped(&tx, &ty)) ui::dispatchTap(tx, ty);
         }
         if (net::pumpMain() > 0) activity = true;  // a background result arrived -> likely a visual change
-        for (auto& u : lan::takeSubmitted()) installAddon(u);
-        {
+        if (lan::hasPending()) {
+            for (auto& u : lan::takeSubmitted()) installAddon(u);
             std::string cu, ck;
             std::string importBody;
             if (lan::takeImport(importBody)) {
@@ -179,9 +191,13 @@ void App::run() {
             }
         };
         runOps();
+        int64_t updateStartUs = playtrace::nowUs();
         if (!stack_.empty()) stack_.back()->update(dt);
         runOps();
         if (stack_.empty()) break;
+        int64_t drawStartUs = playtrace::nowUs();
+        timing.preMs = (updateStartUs - frameStartUs) / 1000.0;
+        timing.updateMs = (drawStartUs - updateStartUs) / 1000.0;
 
         ui::clearHits();
         // Skip all drawing while we're not on screen (HOME menu open, screen dimming/sleep):
@@ -196,10 +212,19 @@ void App::run() {
             // CPU work this frame = everything up to the present; the present then
             // blocks on vsync (not counted). High fps + low cpu ms = we're vsync-bound,
             // not compute-bound.
-            cpuMs_ = (gfx::now() - t) * 1000.0;
+            int64_t presentStartUs = playtrace::nowUs();
+            cpuMs_ = (presentStartUs - frameStartUs) / 1000.0;
             SDL_RenderPresent(renderer_);
+            if (playtrace::active() && !stack_.empty()) {
+                timing.drawMs = (presentStartUs - drawStartUs) / 1000.0;
+                timing.workMs = cpuMs_;
+                timing.presentMs = (playtrace::nowUs() - presentStartUs) / 1000.0;
+                stack_.back()->onPresented(timing);
+            }
         }
+        tailStartUs = playtrace::nowUs();
         gfx::endFrame();
+        gcEndUs = playtrace::nowUs();
 
         // Frame-rate cap. Normally 60 (vsync), but when the UI is idle - no input, no
         // background results, no toasts, and the top screen doesn't need video frames - drop
@@ -229,7 +254,9 @@ void App::run() {
 
         // Manual frame limiter for everything that ISN'T vsync-paced: menus when idle, and any
         // screen while off-screen (we skip the present there, so vsync can't pace us).
-        bool vsyncPaced = focused && maxFps;
+        // A menu in use is paced by vsync as well: adding a sleep on top of the vsync wait made
+        // it miss vblanks and run below 60 fps while scrolling. Only idle menus sleep.
+        bool vsyncPaced = focused && (maxFps || sinceActive <= 2.0);
         double kFrame = 1.0 / 60.0;
         if (!focused) {
             kFrame = 1.0 / 10.0;  // off-screen: idle hard (no present to vsync-pace us)
@@ -237,10 +264,7 @@ void App::run() {
             if (sinceActive > 10.0) kFrame = 1.0 / 15.0;      // deep idle
             else if (sinceActive > 2.0) kFrame = 1.0 / 30.0;  // idle
         }
-        if (!vsyncPaced) {
-            double spent = gfx::now() - t;
-            if (spent < kFrame) svcSleepThread((u64)((kFrame - spent) * 1e9));
-        }
+        if (!vsyncPaced) svcSleepThread((u64)(kFrame * 1e9));
     }
 }
 
@@ -701,6 +725,10 @@ bool App::applyImport(const std::string& body, std::string& summary) {
 
 void App::enrichProgress() {
     if (loading_ > 0) return;  // wait for manifests
+    // Nothing new to look up unless progress changed or the enriched list was reset.
+    int rev = store::progressRevision();
+    if (rev == enrichRev_ && enriched_.size() == enrichedSize_) return;
+    enrichRev_ = rev;
     auto addons = enabledAddons();
     for (auto& p : store::continueWatching(30)) {
         if (!p.name.empty() || p.metaId.empty()) continue;
@@ -719,6 +747,7 @@ void App::enrichProgress() {
             net::postMain([m] { store::updateProgressMeta(*m); });
         });
     }
+    enrichedSize_ = enriched_.size();
 }
 
 int App::batteryPercent(bool* charging) const {

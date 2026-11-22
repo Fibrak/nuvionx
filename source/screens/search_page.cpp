@@ -13,6 +13,7 @@ namespace {
 class SearchPage : public Page {
 public:
     SearchPage() { rows_.showTitles = true; }
+    void animate(float dt) override { rows_.update(dt); }
 
     void update(float dt) override {
         if (input::pressed(input::Y)) {
@@ -131,6 +132,7 @@ public:
     LibraryPage() { rows_.showTitles = true; }
     void onShow() override { refresh(); }
     void onResume() override { refresh(); }
+    void animate(float dt) override { rows_.update(dt); }
 
     void update(float dt) override {
         bool hitTop = false;

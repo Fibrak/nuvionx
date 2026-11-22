@@ -1,10 +1,11 @@
-// Video player: libmpv (FFmpeg) with the software render API, drawn into an
-// SDL streaming texture. Addon subtitles, audio/subtitle track menus,
+// Video player: libmpv (FFmpeg), rendered with OpenGL (GPU) or mpv's software render API
+// into an SDL texture. Addon subtitles, audio/subtitle track menus,
 // resume + progress saving, next-episode autoplay.
 #include <mpv/client.h>
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
 #include <switch.h>
+#include <EGL/egl.h>
 #include <SDL2/SDL_opengles2.h>
 
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -19,6 +21,7 @@
 #include "input.hpp"
 #include "diag.hpp"
 #include "json.hpp"
+#include "playtrace.hpp"
 #include "proxy.hpp"
 #include "screens.hpp"
 #include "store.hpp"
@@ -66,6 +69,7 @@ public:
             App::get().traktScrobble("stop", ctx_.meta.id, ctx_.type, ctx_.season, ctx_.episode, pct);
         }
         saveProgress();
+        std::string traceMeta = trace_ ? traceMetadata() : "";  // needs mpv alive
         stopRenderThread();   // (software path) must finish before the render context is freed
         stopVideoGlThread();  // (threaded GPU path) joins the video thread + releases its context
         if (rctx_) {
@@ -77,6 +81,10 @@ public:
         if (mpvGlCtx_) SDL_GL_DeleteContext(mpvGlCtx_);
         if (mpv_) mpv_terminate_destroy(mpv_);
         if (tex_) SDL_DestroyTexture(tex_);
+        if (trace_) {  // written only now, so the SD write can't disturb playback
+            std::string path = playtrace::finish(traceMeta);
+            App::get().toast(path.empty() ? "Playback trace could not be saved" : "Trace saved: " + path);
+        }
         store::flush();  // one SD write per viewing session instead of one every 15 s
         if (!error_.empty()) writeLogFile();
     }
@@ -84,6 +92,8 @@ public:
     void update(float dt) override {
         (void)dt;
         pumpEvents();
+        if (trace_) pollTraceStatus();
+        updateStartHold();
         if (ended_) return;  // navigation already queued by onEnded()
 
         if (!error_.empty()) {
@@ -114,7 +124,8 @@ public:
             return;
         }
         if (input::pressed(input::A)) {
-            setPause(!paused_);
+            if (startHold_) startHold_ = false;  // pressed during startup: stay paused
+            else setPause(!paused_);
             poke();
         }
         if (input::pressed(input::Left)) seek(-10);
@@ -143,12 +154,27 @@ public:
         const Theme& t = theme();
         SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
         SDL_RenderClear(R);
+        int64_t videoStartUs = trace_ ? playtrace::nowUs() : 0;
+        // The video thread gave up: release its two full-screen textures for the whole video.
+        if (useGl_ && !glThreaded_ && videoThread_.joinable()) stopVideoGlThread();
 
         if (useGl_ && glThreaded_) {
             // Threaded GPU path: the video thread already rendered the frame into an off-screen
             // texture on another core; here we only composite the latest finished one.
             int idx = vpub_.load(std::memory_order_acquire);
-            if (idx >= 0 && videoTex_[idx]) SDL_RenderCopy(R, videoTex_[idx], nullptr, nullptr);
+            if (trace_) {  // buffer index + frame number from one atomic, so the two always agree
+                uint64_t tag = vtag_.load(std::memory_order_acquire);
+                if (tag) {
+                    idx = (int)(tag & 1);
+                    shownSeq_ = (uint32_t)((tag >> 1) - 1);
+                }
+            }
+            if (idx >= 0 && videoTex_[idx]) {
+                SDL_RenderCopy(R, videoTex_[idx], nullptr, nullptr);
+                // Submit now: SDL batches draws, and the video thread may start reusing this
+                // buffer as soon as it publishes the next frame.
+                SDL_RenderFlush(R);
+            }
         } else if (useGl_) {
             // GPU path (single-thread fallback): mpv draws the video straight onto the window
             // framebuffer (GPU does the convert + scale). UI drawn by SDL on top afterwards.
@@ -166,6 +192,7 @@ public:
             }
             if (tex_ && haveFrame_) SDL_RenderCopy(R, tex_, nullptr, nullptr);
         }
+        if (trace_) traceVideoMs_ = (float)((playtrace::nowUs() - videoStartUs) / 1000.0);
 
         if (!error_.empty()) {
             fillRect(0, 0, W, H, withA(t.bg, 230));
@@ -190,7 +217,7 @@ public:
                 text(std::to_string((int)cachePct_) + "%", W / 2, H / 2 + 44, 16, t.text2, true, Center);
         }
 
-        bool show = paused_ || busy || now() < overlayUntil_ || menu_ != None;
+        bool show = (paused_ && !startHold_) || busy || now() < overlayUntil_ || menu_ != None;
         if (show) renderOverlay();
         if (menu_ == Subs || menu_ == Audio) renderMenu();
         if (menu_ == Info) renderInfo();
@@ -214,6 +241,21 @@ public:
         // content (48/50/60) just runs at full 60.
         if (videoFps_ > 32.0) return 0.0;
         return 30.0;
+    }
+
+    void onPresented(const FrameTiming& f) override {
+        if (!trace_) return;
+        double cap = frameCap();
+        playtrace::PresentTiming p;
+        p.pre = (float)f.preMs;
+        p.update = (float)f.updateMs;
+        p.draw = (float)f.drawMs;
+        p.video = traceVideoMs_;
+        p.work = (float)f.workMs;
+        p.block = (float)f.presentMs;
+        p.gc = (float)f.prevGcMs;
+        p.gap = (float)f.prevGapMs;
+        playtrace::present(shownSeq_, traceFlags(), (float)(cap > 0 ? 1000.0 / cap : 1000.0 / 60.0), p);
     }
 
 private:
@@ -337,8 +379,7 @@ private:
             // Give mpv its OWN GL context that shares objects with SDL's. mpv resets GL state
             // to defaults on every render; a separate context keeps that from corrupting
             // SDL's cached state (which otherwise left the UI "bugged out").
-            SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
-            mpvGlCtx_ = (win_ && sdlGlCtx_) ? SDL_GL_CreateContext(win_) : nullptr;  // becomes current
+            mpvGlCtx_ = createSharedMpvContext();  // becomes current
             if (!mpvGlCtx_) {
                 useGl_ = false;
                 if (win_ && sdlGlCtx_) SDL_GL_MakeCurrent(win_, sdlGlCtx_);
@@ -389,6 +430,9 @@ private:
         mpv_observe_property(mpv_, 9, "video-params/h", MPV_FORMAT_INT64);
         mpv_observe_property(mpv_, 10, "container-fps", MPV_FORMAT_DOUBLE);
 
+        trace_ = st.playbackTrace && playtrace::begin();  // before the video thread starts
+        if (st.playbackTrace && !trace_) log("NuvioNX: not enough memory for the playback trace");
+
         if (!useGl_) {
             // Software path: convert into an SDL streaming texture on a background thread.
             vw_ = st.render1080 ? 1920 : 1280;
@@ -420,6 +464,11 @@ private:
             std::to_string((int)appletGetAppletType()));
         log("NuvioNX: playing " + std::string(relayed ? "(via local HTTPS relay) " : "") + redact(stream_.url) +
             " -> " + playUrl_.substr(0, playUrl_.find("/s/") + 3) + "...");
+        // Start paused and unpause once the first frame has been rendered. That first render is
+        // a 300-550 ms stall (seen in every trace); taking it before the clock runs means it
+        // can't make the opening frames late and get them dropped.
+        mpv_set_property_string(mpv_, "pause", "yes");
+        startHold_ = true;
         const char* cmd[] = {"loadfile", playUrl_.c_str(), nullptr};
         mpv_command_async(mpv_, 0, cmd);
         appletSetMediaPlaybackState(true);
@@ -434,8 +483,22 @@ private:
                 case MPV_EVENT_FILE_LOADED:
                     loaded_ = true;
                     buffering_ = false;
+                    lastDisturb_ = now();
                     if (subsReady_) applyAddonSubs();
                     break;
+                case MPV_EVENT_GET_PROPERTY_REPLY: {
+                    auto* p = (mpv_event_property*)ev->data;
+                    if (ev->error < 0 || !p || !p->data) break;
+                    switch (ev->reply_userdata) {
+                        case kTraceDecDrops: traceStatus_.decoderDrops = *(int64_t*)p->data; break;
+                        case kTraceVoDrops: traceStatus_.voDrops = *(int64_t*)p->data; break;
+                        case kTraceAvsync: traceStatus_.avsyncMs = *(double*)p->data * 1000.0; break;
+                        case kTraceCache: traceStatus_.cacheSec = *(double*)p->data; break;
+                        case kTraceSpeed: traceStatus_.cacheKBps = *(int64_t*)p->data / 1000.0; break;
+                        case kTraceVfFps: traceStatus_.vfFps = *(double*)p->data; break;
+                    }
+                    break;
+                }
                 case MPV_EVENT_LOG_MESSAGE: {
                     auto* m = (mpv_event_log_message*)ev->data;
                     std::string line = std::string("[") + m->prefix + "] " + m->level + ": " + m->text;
@@ -465,7 +528,10 @@ private:
                         case 1: pos_ = *(double*)p->data; break;
                         case 2: dur_ = *(double*)p->data; break;
                         case 3: paused_ = *(int*)p->data != 0; break;
-                        case 4: buffering_ = *(int*)p->data != 0; break;
+                        case 4:
+                            buffering_ = *(int*)p->data != 0;
+                            lastDisturb_ = now();
+                            break;
                         case 5: cachePct_ = *(int64_t*)p->data; break;
                         case 6:
                             hwdecCurrent_ = *(char**)p->data ? *(char**)p->data : "";
@@ -493,9 +559,90 @@ private:
 
     void poke() { overlayUntil_ = now() + 4.0; }
 
+    // ---------------------------------------------------------- paused first frame
+    // True if the render about to run will draw a real video frame during the startup hold.
+    bool holdFrameQueued() {
+        if (!startHold_.load(std::memory_order_relaxed)) return false;
+        mpv_render_frame_info fi{};
+        mpv_render_param q{MPV_RENDER_PARAM_NEXT_FRAME_INFO, &fi};
+        return mpv_render_context_get_info(rctx_, q) >= 0 && (fi.flags & MPV_RENDER_FRAME_INFO_PRESENT);
+    }
+
+    void updateStartHold() {
+        if (!startHold_ || !loaded_ || !error_.empty()) return;
+        if (appletGetFocusState() != AppletFocusState_InFocus) {  // HOME menu: stay paused
+            startHold_ = false;
+            return;
+        }
+        if (holdLoadedAt_ == 0) holdLoadedAt_ = now();
+        // The timeout covers files with no video track, which never render a frame.
+        if (firstFrameRendered_.load(std::memory_order_acquire) || now() - holdLoadedAt_ > 8.0) {
+            startHold_ = false;
+            setPause(false);
+        }
+    }
+
+    // ---------------------------------------------------------- playback trace
+    uint8_t traceFlags() const {
+        uint8_t f = 0;
+        if (paused_) f |= playtrace::Paused;
+        if (!loaded_ || buffering_) f |= playtrace::Buffering;
+        if (menu_ != None || now() < overlayUntil_) f |= playtrace::UiVisible;
+        if (now() - lastDisturb_ < 2.0) f |= playtrace::Disturbed;
+        return f;
+    }
+
+    // Twice a second: log the latest values, then request fresh ones. The requests are async
+    // so the main thread never waits on mpv's core lock; replies arrive in pumpEvents().
+    void pollTraceStatus() {
+        if (!mpv_ || now() - lastTracePoll_ < 0.5) return;
+        lastTracePoll_ = now();
+        traceStatus_.flags = traceFlags();
+        traceStatus_.relayTransfers = proxy::activeTransfers();
+        playtrace::status(traceStatus_);
+        mpv_get_property_async(mpv_, kTraceDecDrops, "decoder-frame-drop-count", MPV_FORMAT_INT64);
+        mpv_get_property_async(mpv_, kTraceVoDrops, "frame-drop-count", MPV_FORMAT_INT64);
+        mpv_get_property_async(mpv_, kTraceAvsync, "avsync", MPV_FORMAT_DOUBLE);
+        mpv_get_property_async(mpv_, kTraceCache, "demuxer-cache-duration", MPV_FORMAT_DOUBLE);
+        mpv_get_property_async(mpv_, kTraceSpeed, "cache-speed", MPV_FORMAT_INT64);
+        mpv_get_property_async(mpv_, kTraceVfFps, "estimated-vf-fps", MPV_FORMAT_DOUBLE);
+    }
+
+    std::string outputSizeLabel() const {
+        int w = vw_, h = vh_;
+        if (useGl_) SDL_GetRendererOutputSize(R, &w, &h);
+        return std::to_string(w) + "x" + std::to_string(h);
+    }
+
+    // Technical details only: no title or stream URL goes in the trace file.
+    std::string traceMetadata() {
+        std::string m;
+        auto add = [&m](const char* k, const std::string& v) { m += std::string(k) + "=" + v + "\n"; };
+        add("codec", mpvString(mpv_, "video-codec"));
+        add("resolution", mpvString(mpv_, "video-params/w") + "x" + mpvString(mpv_, "video-params/h"));
+        add("pixel_format", mpvString(mpv_, "video-params/pixelformat"));
+        add("container_fps", mpvString(mpv_, "container-fps"));
+        add("video_bitrate", mpvString(mpv_, "video-bitrate"));
+        add("hwdec", mpvString(mpv_, "hwdec-current"));
+        add("audio", mpvString(mpv_, "audio-codec-name"));
+        add("render_path", glThreaded_ ? "gpu-threaded" : (useGl_ ? "gpu-main-thread" : "software"));
+        {
+            std::lock_guard<std::mutex> lk(wakeMx_);
+            add("video_thread", videoThreadError_.empty()
+                                    ? (glThreaded_ ? "running (" + std::string(videoThreadSurface_.load()) + ")"
+                                                   : std::string("not started"))
+                                    : "failed: " + videoThreadError_);
+        }
+        add("gl_contexts", glContextInfo_);
+        add("output", outputSizeLabel());
+        add("cpu_boost", boosted_ ? "1" : "0");
+        add("memory_mb", std::to_string(App::get().memoryBudgetMB()));
+        return m;
+    }
+
     // Trakt scrobbling: "start" when playback (re)starts, "pause" when paused.
     void updateScrobble() {
-        if (!loaded_ || dur_ <= 0 || !error_.empty()) return;
+        if (!loaded_ || dur_ <= 0 || !error_.empty() || startHold_) return;
         bool playing = !paused_;
         if (scrobbleStarted_ && playing == scrobblePlaying_) return;
         double pct = pos_ / dur_ * 100.0;
@@ -508,6 +655,107 @@ private:
     // GPU render: draw the current mpv video frame onto the window framebuffer (FBO 0).
     // Runs on the main thread with SDL's GL context current. SDL_RenderFlush lets SDL and
     // raw GL (mpv) share the context; mpv restores GL state afterwards so SDL keeps drawing.
+    // Create mpv's context in the same API as SDL's renderer. SDL_Renderer forces OpenGL ES
+    // for its own context and then restores the default attributes, so a plain
+    // SDL_GL_CreateContext can produce a context whose objects SDL's textures aren't visible in.
+    SDL_GLContext createSharedMpvContext() {
+        if (!win_ || !sdlGlCtx_) return nullptr;
+        int mask = 0, major = 0, minor = 0, share = 0;
+        SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &mask);
+        SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &major);
+        SDL_GL_GetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, &minor);
+        SDL_GL_GetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, &share);
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+        SDL_GLContext ctx = nullptr;
+        static const int versions[][2] = {{3, 2}, {3, 1}, {3, 0}};
+        for (auto& v : versions) {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, v[0]);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, v[1]);
+            ctx = SDL_GL_CreateContext(win_);
+            if (ctx) break;
+            SDL_GL_MakeCurrent(win_, sdlGlCtx_);  // the share source must stay current
+        }
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, mask);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, major);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, minor);
+        if (!ctx) ctx = SDL_GL_CreateContext(win_);  // last resort: the previous behaviour
+        SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, share);
+        if (ctx) {
+            typedef const GLubyte* (*PFN_glGetString)(GLenum);
+            auto getString = (PFN_glGetString)SDL_GL_GetProcAddress("glGetString");
+            const GLubyte* version = getString ? getString(GL_VERSION) : nullptr;
+            EGLDisplay dpy = eglGetCurrentDisplay();
+            EGLint mpvApi = 0, sdlApi = 0;
+            eglQueryContext(dpy, (EGLContext)ctx, EGL_CONTEXT_CLIENT_TYPE, &mpvApi);
+            eglQueryContext(dpy, (EGLContext)sdlGlCtx_, EGL_CONTEXT_CLIENT_TYPE, &sdlApi);
+            char info[160];
+            snprintf(info, sizeof info, "mpv api 0x%04x, sdl api 0x%04x, %s", (unsigned)mpvApi, (unsigned)sdlApi,
+                     version ? (const char*)version : "unknown");
+            glContextInfo_ = info;
+            log("NuvioNX: GL contexts: " + glContextInfo_);
+        }
+        return ctx;
+    }
+
+    // Remember why the threaded path isn't running (any thread).
+    void videoThreadFailed(const std::string& why) {
+        {
+            std::lock_guard<std::mutex> lk(wakeMx_);
+            videoThreadError_ = why;
+        }
+        log("NuvioNX: threaded render unavailable: " + why);
+    }
+
+    // Bind mpv's context on the video thread WITHOUT the window surface. The main thread keeps
+    // that surface current for SDL, and EGL refuses to bind it on a second thread
+    // (EGL_BAD_ACCESS). This thread only draws into FBOs, so it doesn't need a window surface.
+    bool bindVideoThreadContext() {
+        EGLContext ctx = (EGLContext)mpvGlCtx_;
+        const char* ext = eglQueryString(eglDisplay_, EGL_EXTENSIONS);
+        if (ext && strstr(ext, "EGL_KHR_surfaceless_context") &&
+            eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
+            videoThreadSurface_ = "surfaceless";
+            return true;
+        }
+        EGLint configId = 0, count = 0;
+        EGLConfig config = nullptr;
+        eglQueryContext(eglDisplay_, ctx, EGL_CONFIG_ID, &configId);
+        const EGLint configAttrs[] = {EGL_CONFIG_ID, configId, EGL_NONE};
+        if (eglChooseConfig(eglDisplay_, configAttrs, &config, 1, &count) && count == 1) {
+            const EGLint size[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+            videoPbuffer_ = eglCreatePbufferSurface(eglDisplay_, config, size);
+            if (videoPbuffer_ != EGL_NO_SURFACE && eglMakeCurrent(eglDisplay_, videoPbuffer_, videoPbuffer_, ctx)) {
+                videoThreadSurface_ = "pbuffer";
+                return true;
+            }
+        }
+        char why[64];
+        snprintf(why, sizeof why, "couldn't bind the GL context (EGL error 0x%04x)", (unsigned)eglGetError());
+        videoThreadFailed(why);
+        releaseVideoThreadContext();
+        return false;
+    }
+
+    void releaseVideoThreadContext() {
+        eglMakeCurrent(eglDisplay_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (videoPbuffer_ != EGL_NO_SURFACE) {
+            eglDestroySurface(eglDisplay_, videoPbuffer_);
+            videoPbuffer_ = EGL_NO_SURFACE;
+        }
+    }
+
+    // Trace one rendered frame. t0/t1/t2 = before render, after render, after glFinish
+    // (nanoseconds: this mpv's target_time is in ns, despite render.h saying microseconds).
+    void traceRenderedFrame(const mpv_render_frame_info& fi, int64_t t0, int64_t t1, int64_t t2) {
+        if (!fi.flags) return;  // mpv had no frame queued: nothing was shown
+        const uint64_t notNew = MPV_RENDER_FRAME_INFO_REDRAW | MPV_RENDER_FRAME_INFO_REPEAT;
+        if ((fi.flags & MPV_RENDER_FRAME_INFO_PRESENT) && !(fi.flags & notNew)) videoSeq_++;
+        bool timed = fi.target_time > 0;
+        playtrace::videoFrame(videoSeq_, (uint32_t)fi.flags, timed ? (fi.target_time - t0) / 1e6f : NAN,
+                              (t1 - t0) / 1e6f, (t2 - t1) / 1e6f, timed ? (t2 - fi.target_time) / 1e6f : NAN);
+    }
+
     void renderVideoGl() {
         if (!rctx_ || !win_ || !mpvGlCtx_) return;
         SDL_RenderFlush(R);                    // finish SDL's queued GL work on its context
@@ -524,7 +772,22 @@ private:
             {MPV_RENDER_PARAM_FLIP_Y, &flip},
             {MPV_RENDER_PARAM_INVALID, nullptr},
         };
+        bool tracing = trace_ && playtrace::active();
+        mpv_render_frame_info frameInfo{};
+        int64_t traceT0 = 0;
+        if (tracing) {
+            traceT0 = mpv_get_time_ns(mpv_);
+            mpv_render_param q{MPV_RENDER_PARAM_NEXT_FRAME_INFO, &frameInfo};
+            mpv_render_context_get_info(rctx_, q);
+        }
+        bool holdFrame = holdFrameQueued();
         mpv_render_context_render(rctx_, params);
+        if (holdFrame) firstFrameRendered_.store(true, std::memory_order_release);
+        if (tracing) {
+            int64_t traceT1 = mpv_get_time_ns(mpv_);
+            traceRenderedFrame(frameInfo, traceT0, traceT1, traceT1);
+            shownSeq_ = videoSeq_;
+        }
         SDL_GL_MakeCurrent(win_, sdlGlCtx_);   // hand the context back to SDL for the UI
     }
 
@@ -535,7 +798,10 @@ private:
     // main thread with SDL's context current. On any failure we leave glThreaded_ false and the
     // player falls back to the single-thread renderVideoGl path.
     void setupVideoGlThread() {
-        if (!rctx_ || !win_ || !mpvGlCtx_ || !sdlGlCtx_) return;
+        if (!rctx_ || !win_ || !mpvGlCtx_ || !sdlGlCtx_) {
+            videoThreadFailed("missing render context or window");
+            return;
+        }
         // Resolve the GLES2 framebuffer functions (SDL's GL context is current here).
         glGenFramebuffers_ = (PFN_glGenFramebuffers)SDL_GL_GetProcAddress("glGenFramebuffers");
         glBindFramebuffer_ = (PFN_glBindFramebuffer)SDL_GL_GetProcAddress("glBindFramebuffer");
@@ -546,14 +812,26 @@ private:
         glFinish_ = (PFN_glFinish)SDL_GL_GetProcAddress("glFinish");
         if (!glGenFramebuffers_ || !glBindFramebuffer_ || !glFramebufferTexture2D_ ||
             !glCheckFramebufferStatus_ || !glDeleteFramebuffers_ || !glGetIntegerv_ || !glFinish_) {
-            log("NuvioNX: GL framebuffer functions unavailable; threaded render disabled");
+            videoThreadFailed("GL framebuffer functions unavailable");
+            return;
+        }
+        eglDisplay_ = eglGetCurrentDisplay();  // SDL's context is current here
+        if (eglDisplay_ == EGL_NO_DISPLAY) {
+            videoThreadFailed("no current EGL display");
             return;
         }
         SDL_GetRendererOutputSize(R, &vw2_, &vh2_);
-        if (vw2_ <= 0 || vh2_ <= 0) return;
+        if (vw2_ <= 0 || vh2_ <= 0) {
+            videoThreadFailed("invalid output size: " + std::string(SDL_GetError()));
+            return;
+        }
         for (int i = 0; i < 2; i++) {
             videoTex_[i] = SDL_CreateTexture(R, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_TARGET, vw2_, vh2_);
-            if (!videoTex_[i]) { teardownVideoGl(); return; }
+            if (!videoTex_[i]) {
+                videoThreadFailed("target texture " + std::to_string(i) + ": " + SDL_GetError());
+                teardownVideoGl();
+                return;
+            }
             SDL_SetTextureBlendMode(videoTex_[i], SDL_BLENDMODE_NONE);
             // Force SDL to allocate the backing GL texture at full size.
             SDL_SetRenderTarget(R, videoTex_[i]);
@@ -562,11 +840,19 @@ private:
             SDL_SetRenderTarget(R, nullptr);
             // Discover the underlying GL texture name (shared with mpv's context by name).
             float tw = 0, th = 0;
-            if (SDL_GL_BindTexture(videoTex_[i], &tw, &th) != 0) { teardownVideoGl(); return; }
+            if (SDL_GL_BindTexture(videoTex_[i], &tw, &th) != 0) {
+                videoThreadFailed("bind texture " + std::to_string(i) + ": " + SDL_GetError());
+                teardownVideoGl();
+                return;
+            }
             GLint id = 0;
             glGetIntegerv_(GL_TEXTURE_BINDING_2D, &id);
             SDL_GL_UnbindTexture(videoTex_[i]);
-            if (id == 0) { teardownVideoGl(); return; }
+            if (id == 0) {
+                videoThreadFailed("texture " + std::to_string(i) + " has no GL name");
+                teardownVideoGl();
+                return;
+            }
             videoGlId_[i] = (unsigned)id;
         }
         SDL_RenderFlush(R);  // submit SDL's setup GL work before the thread touches the textures
@@ -578,8 +864,7 @@ private:
     }
 
     void videoGlLoop() {
-        if (SDL_GL_MakeCurrent(win_, mpvGlCtx_) != 0) {
-            log("NuvioNX: video thread couldn't bind the GL context");
+        if (!bindVideoThreadContext()) {
             glThreaded_ = false;
             return;
         }
@@ -587,12 +872,16 @@ private:
         for (int i = 0; i < 2; i++) {
             glBindFramebuffer_(GL_FRAMEBUFFER, videoFbo_[i]);
             glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, videoGlId_[i], 0);
-            if (glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-                log("NuvioNX: video FBO incomplete; threaded render disabled");
+            GLenum fboStatus = glCheckFramebufferStatus_(GL_FRAMEBUFFER);
+            if (fboStatus != GL_FRAMEBUFFER_COMPLETE) {
+                char why[64];
+                snprintf(why, sizeof why, "FBO %d incomplete (status 0x%04x, texture %u)", i, (unsigned)fboStatus,
+                         videoGlId_[i]);
+                videoThreadFailed(why);
                 glBindFramebuffer_(GL_FRAMEBUFFER, 0);
                 glDeleteFramebuffers_(2, videoFbo_);
                 videoFbo_[0] = videoFbo_[1] = 0;
-                SDL_GL_MakeCurrent(win_, nullptr);
+                releaseVideoThreadContext();
                 glThreaded_ = false;  // main thread falls back to renderVideoGl
                 return;
             }
@@ -607,6 +896,14 @@ private:
                 wake_ = false;
             }
             if (!(mpv_render_context_update(rctx_) & MPV_RENDER_UPDATE_FRAME)) continue;
+            bool tracing = trace_ && playtrace::active();
+            mpv_render_frame_info frameInfo{};
+            int64_t traceT0 = 0;
+            if (tracing) {
+                traceT0 = mpv_get_time_ns(mpv_);
+                mpv_render_param q{MPV_RENDER_PARAM_NEXT_FRAME_INFO, &frameInfo};
+                mpv_render_context_get_info(rctx_, q);
+            }
             int back = (vpub_.load(std::memory_order_relaxed) == 0) ? 1 : 0;  // the un-published buffer
             mpv_opengl_fbo fbo{};
             fbo.fbo = (int)videoFbo_[back];
@@ -618,13 +915,20 @@ private:
                 {MPV_RENDER_PARAM_FLIP_Y, &flip},
                 {MPV_RENDER_PARAM_INVALID, nullptr},
             };
+            bool holdFrame = holdFrameQueued();
             mpv_render_context_render(rctx_, params);
+            int64_t traceT1 = tracing ? mpv_get_time_ns(mpv_) : 0;
             glFinish_();  // the main thread (other context) samples this texture; make sure it's done
+            if (holdFrame) firstFrameRendered_.store(true, std::memory_order_release);
+            if (tracing) {
+                traceRenderedFrame(frameInfo, traceT0, traceT1, mpv_get_time_ns(mpv_));
+                vtag_.store(((uint64_t)(videoSeq_ + 1) << 1) | (uint64_t)back, std::memory_order_release);
+            }
             vpub_.store(back, std::memory_order_release);
         }
         if (videoFbo_[0] || videoFbo_[1]) glDeleteFramebuffers_(2, videoFbo_);
         videoFbo_[0] = videoFbo_[1] = 0;
-        SDL_GL_MakeCurrent(win_, nullptr);  // release so the main thread can free the context
+        releaseVideoThreadContext();  // so the main thread can bind and free the context
     }
 
     void stopVideoGlThread() {
@@ -637,7 +941,7 @@ private:
             wakeCv_.notify_one();
             videoThread_.join();
         }
-        if (rctx_ && glThreaded_) mpv_render_context_set_update_callback(rctx_, nullptr, nullptr);
+        if (rctx_ && useGl_) mpv_render_context_set_update_callback(rctx_, nullptr, nullptr);
         glThreaded_ = false;
         teardownVideoGl();
     }
@@ -709,7 +1013,9 @@ private:
                 {MPV_RENDER_PARAM_SW_POINTER, frames_[back]},
                 {MPV_RENDER_PARAM_INVALID, nullptr},
             };
+            bool holdFrame = holdFrameQueued();
             mpv_render_context_render(rctx_, params);
+            if (holdFrame) firstFrameRendered_.store(true, std::memory_order_release);
             std::lock_guard<std::mutex> lk(frameMx_);
             front_ = back;
             frameReady_ = true;
@@ -748,6 +1054,7 @@ private:
         std::string pct = std::to_string(std::max(0.0, std::min(100.0, frac * 100.0)));
         const char* cmd[] = {"seek", pct.c_str(), "absolute-percent", nullptr};
         mpv_command_async(mpv_, 0, cmd);
+        lastDisturb_ = now();
         pos_ = dur_ * frac;
         poke();
     }
@@ -757,6 +1064,7 @@ private:
         std::string s = std::to_string(secs);
         const char* cmd[] = {"seek", s.c_str(), "relative", nullptr};
         mpv_command_async(mpv_, 0, cmd);
+        lastDisturb_ = now();
         pos_ = std::max(0.0, std::min(dur_ > 0 ? dur_ : 1e9, pos_ + secs));
         poke();
     }
@@ -1010,11 +1318,12 @@ private:
         row("Resolution", mpvString(mpv_, "video-params/w") + "x" + mpvString(mpv_, "video-params/h"));
         row("HW decode", mpvString(mpv_, "hwdec-current"));
         row("Audio", mpvString(mpv_, "audio-codec-name") + "  ->  " + mpvString(mpv_, "current-ao"));
-        row("Dropped", mpvString(mpv_, "frame-drop-count"));
+        row("Dropped", mpvString(mpv_, "frame-drop-count") + " output, " +
+                           mpvString(mpv_, "decoder-frame-drop-count") + " decoder");
         std::string cache = mpvString(mpv_, "demuxer-cache-duration");
         if (!cache.empty()) cache = cache.substr(0, cache.find('.')) + " s";
         row("Buffered", cache);
-        row("Output", std::to_string(vw_) + "x" + std::to_string(vh_) + " (software)");
+        row("Output", outputSizeLabel() + (glThreaded_ ? " (GPU, threaded)" : useGl_ ? " (GPU)" : " (software)"));
     }
 
     // ---------------------------------------------------------- diagnostics log
@@ -1079,7 +1388,7 @@ private:
     unsigned videoFbo_[2] = {0, 0};                  // FBOs (live in mpv's context only)
     std::atomic<int> vpub_{-1};                      // index of the last finished frame (-1 = none)
     int vw2_ = 0, vh2_ = 0;                           // off-screen render size
-    bool glThreaded_ = false;                        // true once the threaded path is live
+    std::atomic<bool> glThreaded_{false};            // true once the threaded path is live
     PFN_glGenFramebuffers glGenFramebuffers_ = nullptr;
     PFN_glBindFramebuffer glBindFramebuffer_ = nullptr;
     PFN_glFramebufferTexture2D glFramebufferTexture2D_ = nullptr;
@@ -1087,6 +1396,25 @@ private:
     PFN_glDeleteFramebuffers glDeleteFramebuffers_ = nullptr;
     PFN_glGetIntegerv glGetIntegerv_ = nullptr;
     PFN_glFinish glFinish_ = nullptr;
+
+    // Startup hold: paused until the first frame has been rendered.
+    std::atomic<bool> startHold_{false}, firstFrameRendered_{false};
+    double holdLoadedAt_ = 0;
+
+    // Playback trace (debug). trace_ is set before the video thread starts and never changes.
+    enum : uint64_t { kTraceDecDrops = 101, kTraceVoDrops, kTraceAvsync, kTraceCache, kTraceSpeed, kTraceVfFps };
+    bool trace_ = false;
+    std::atomic<uint64_t> vtag_{0};  // ((frame number + 1) << 1) | buffer index
+    uint32_t videoSeq_ = 0;          // whichever thread renders video
+    uint32_t shownSeq_ = 0;          // main thread only
+    float traceVideoMs_ = 0;         // main thread's time in the video step of this frame
+    std::string videoThreadError_;   // why the threaded path isn't running (guarded by wakeMx_)
+    std::atomic<const char*> videoThreadSurface_{"none"};
+    EGLDisplay eglDisplay_ = EGL_NO_DISPLAY;
+    EGLSurface videoPbuffer_ = EGL_NO_SURFACE;  // only if surfaceless contexts are unsupported
+    std::string glContextInfo_;  // API and version of the two GL contexts
+    playtrace::Status traceStatus_;
+    double lastTracePoll_ = 0, lastDisturb_ = 0;
 
     double pos_ = 0, dur_ = 0;
     bool paused_ = false, buffering_ = true, loaded_ = false, ended_ = false;

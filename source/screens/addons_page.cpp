@@ -49,6 +49,10 @@ public:
             }
         }
         if (input::pressed(input::Y)) install();
+        animate(dt);
+    }
+
+    void animate(float dt) override {
         float target = std::max(0.f, (sel_ + 1) * kItemH - kItemH * 2);
         scroll_ = ui::approach(scroll_, target, dt, 16);
     }

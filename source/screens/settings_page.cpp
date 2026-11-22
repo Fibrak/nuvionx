@@ -52,6 +52,10 @@ public:
             store::saveSettings();
             App::get().toast("Key removed");
         }
+        animate(dt);
+    }
+
+    void animate(float dt) override {
         float target = std::max(0.f, sel_ * kRowH - kRowH * 5);
         scroll_ = ui::approach(scroll_, target, dt, 16);
     }

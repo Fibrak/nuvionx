@@ -21,6 +21,7 @@ struct Settings {
     bool diskImageCache = false;  // cache artwork on the SD card (off = fewer SD writes)
     bool cpuBoost = false;        // CPU boost mode (1785 MHz) while a video plays
     bool perfOverlay = false;     // debug FPS/cache overlay (toggle with ZL+ZR)
+    bool playbackTrace = false;   // debug per-frame CSV trace (ZL+ZR); this session only, never saved
     // Debrid API keys (imported from the Nuvio account or entered manually)
     std::string realDebridKey, torboxKey, premiumizeKey;
 };

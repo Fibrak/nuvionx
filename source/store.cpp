@@ -6,9 +6,11 @@
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <mutex>
 #include <unordered_set>
 
 #include "json.hpp"
+#include "net.hpp"
 #include "sdfile.hpp"
 
 namespace store {
@@ -187,32 +189,71 @@ int progressRevision() { return g_progressRev; }
 static time_t g_lastFlush = 0;
 static const int kFlushIntervalSec = 300;
 
-static void writeProgressFile();
+static std::string progressJson();
 
 static void saveProgress() {
     g_progressRev++;
     g_progressDirty = true;
 }
 
-void tick() {
-    time_t t = time(nullptr);
-    if (g_lastFlush == 0) g_lastFlush = t;
-    if ((g_progressDirty || g_manifestsDirty) && t - g_lastFlush >= kFlushIntervalSec) flush();
-}
+// Snapshots waiting to be written. g_writeMx is held for the whole write, so files are always
+// written oldest-first and flush() can't return before an earlier background write is done.
+static std::mutex g_writeMx;
+static std::string g_stagedProgress, g_stagedManifests;
+static bool g_haveStagedProgress = false, g_haveStagedManifests = false;
 
-void flush() {
+// Main thread, with g_writeMx held.
+static void stageDirtyData() {
     if (g_progressDirty) {
-        writeProgressFile();
+        g_stagedProgress = progressJson();
+        g_haveStagedProgress = true;
         g_progressDirty = false;
     }
     if (g_manifestsDirty) {
-        writeFile(path("manifests.json"), g_manifests.dump());
+        g_stagedManifests = g_manifests.dump();
+        g_haveStagedManifests = true;
         g_manifestsDirty = false;
     }
+}
+
+static void writeStagedData() {
+    std::lock_guard<std::mutex> lk(g_writeMx);
+    if (g_haveStagedProgress) {
+        writeFile(path("progress.json"), g_stagedProgress);
+        g_haveStagedProgress = false;
+        std::string().swap(g_stagedProgress);
+    }
+    if (g_haveStagedManifests) {
+        writeFile(path("manifests.json"), g_stagedManifests);
+        g_haveStagedManifests = false;
+        std::string().swap(g_stagedManifests);
+    }
+}
+
+// The periodic save runs on a worker: an SD write on the main thread stalls video and menus.
+void tick() {
+    time_t t = time(nullptr);
+    if (g_lastFlush == 0) g_lastFlush = t;
+    if (!(g_progressDirty || g_manifestsDirty) || t - g_lastFlush < kFlushIntervalSec) return;
+    std::unique_lock<std::mutex> lk(g_writeMx, std::try_to_lock);
+    if (!lk.owns_lock()) return;  // a write is still running: try again next tick
+    stageDirtyData();
+    lk.unlock();
+    g_lastFlush = t;
+    net::runAsync(writeStagedData);
+}
+
+// Synchronous: on return everything is on the SD card (exit, leaving the player, HOME).
+void flush() {
+    {
+        std::lock_guard<std::mutex> lk(g_writeMx);
+        stageDirtyData();
+    }
+    writeStagedData();
     g_lastFlush = time(nullptr);
 }
 
-static void writeProgressFile() {
+static std::string progressJson() {
     json::Value o = json::Value::object();
     for (auto& kv : g_progress) {
         const Progress& p = kv.second;
@@ -231,9 +272,9 @@ static void writeProgressFile() {
         if (p.pct) e.set("pct", true);
         e.set("dur", p.dur);
         e.set("updated", p.updated);
-        o.set(kv.first, e);
+        o.append(kv.first, std::move(e));  // map keys are unique
     }
-    writeFile(path("progress.json"), o.dump());
+    return o.dump();
 }
 
 const Progress* progress(const std::string& videoId) {
@@ -263,12 +304,15 @@ const Progress* latestForMeta(const std::string& metaId) {
 }
 
 std::vector<Progress> continueWatching(size_t max) {
-    std::vector<Progress> all;
-    for (auto& kv : g_progress) all.push_back(kv.second);
-    std::sort(all.begin(), all.end(), [](const Progress& a, const Progress& b) { return a.updated > b.updated; });
+    // Sort pointers: copying every entry (8 strings each) just to keep the top few is wasteful.
+    std::vector<const Progress*> all;
+    all.reserve(g_progress.size());
+    for (auto& kv : g_progress) all.push_back(&kv.second);
+    std::sort(all.begin(), all.end(), [](const Progress* a, const Progress* b) { return a->updated > b->updated; });
     std::vector<Progress> out;
     std::unordered_set<std::string> seen;
-    for (auto& p : all) {
+    for (const Progress* pp : all) {
+        const Progress& p = *pp;
         if (seen.count(p.metaId)) continue;
         seen.insert(p.metaId);  // only the most recent entry per title counts
         if (p.updated < 0) continue;  // hidden by the user

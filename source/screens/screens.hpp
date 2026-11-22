@@ -23,6 +23,9 @@ class Page : public Screen {
 public:
     virtual std::vector<ui::Hint> hints() = 0;
     virtual void onShow() {}
+    // Advance scroll/focus animations without reading input. Runs instead of update() while
+    // focus is on the tab bar, so a scroll in progress still finishes.
+    virtual void animate(float dt) { (void)dt; }
     // Pages set this when the user presses Up past their top edge.
     bool wantsTabBar = false;
 };

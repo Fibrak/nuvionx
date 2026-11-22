@@ -30,6 +30,7 @@ public:
         else refreshContinue();
     }
     void onResume() override { refreshContinue(); }
+    void animate(float dt) override { rows_.update(dt); }
 
     void update(float dt) override {
         if (builtRev_ != App::get().addonsRevision()) rebuild();
@@ -97,7 +98,7 @@ public:
         // Hide the top row's "Continue Watching" header while loading; the wave sits in its
         // place and the real title appears once the first entry is ready.
         rows_.suppressFocusedTitle = loadAlpha_ > 0.05f;
-        rows_.render(372, 650);
+        rows_.render(372, 650, 40);  // the hero's text ends above y = 332, leaving room to fade
         renderLoading();  // over the (now title-less) header slot
     }
 
@@ -116,12 +117,32 @@ private:
         const float slotH = 110;
         SDL_Texture* logo = m.logo.empty() ? nullptr : image(m.logo, 600, 200);
         float lf = logo ? imageFade(m.logo, 0.2f) : 0.f;
-        if (lf < 1.f) {
+        // Give the logo a moment to arrive before falling back to the text title, so the title
+        // doesn't flash up and get replaced. No logo, or a failed one, shows the text at once.
+        const float kLogoWait = 1.5f;
+        if (heroId_ != m.id || heroLogo_ != m.logo) {
+            heroId_ = m.id;
+            heroLogo_ = m.logo;
+            heroSince_ = now();
+            heroTitleShown_ = false;
+        }
+        bool hasLogo = m.logo.compare(0, 4, "http") == 0 && !imageFailed(m.logo);
+        float titleIn = 1.f;
+        if (hasLogo && !heroTitleShown_) {
+            float waited = (float)(now() - heroSince_);
+            if (!logo && waited >= kLogoWait) heroTitleShown_ = true;
+            titleIn = heroTitleShown_ ? 0.f : -1.f;  // -1 = keep the title hidden
+        }
+        if (hasLogo && heroTitleShown_) {
+            if (heroTitleAt_ < heroSince_) heroTitleAt_ = now();  // the slow-logo fallback starts now
+            titleIn = std::min(1.f, (float)((now() - heroTitleAt_) / 0.2f));
+        }
+        if (lf < 1.f && titleIn > 0.f) {
             // text title, bottom-aligned in the slot, fading out as the logo fades in
             auto lines = wrap(m.name, 40, 640, 2, true);
             float ty = y + slotH - lines.size() * 50;
             for (auto& l : lines) {
-                text(l, x, ty, 40, withA(t.text, (Uint8)(255 * (1.f - lf))), true);
+                text(l, x, ty, 40, withA(t.text, (Uint8)(255 * titleIn * (1.f - lf))), true);
                 ty += 50;
             }
         }
@@ -281,6 +302,10 @@ private:
     double firstShow_ = 0;
     float loadAlpha_ = 0;
     bool doneLoading_ = false;
+    // Hero title fallback while the current entry's logo is loading.
+    std::string heroId_, heroLogo_;
+    double heroSince_ = 0, heroTitleAt_ = -1;
+    bool heroTitleShown_ = false;
 };
 
 }  // namespace

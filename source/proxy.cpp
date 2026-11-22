@@ -222,6 +222,7 @@ size_t fetchWriteCb(char* buf, size_t size, size_t n, void* ud) {
 
 // Blocking ranged GET into RAM. Returns the curl result; fills `out`.
 CURLcode fetchRange(const Target& t, long long off, long long len, FetchResult& out) {
+    out.body.reserve((size_t)len);  // avoids repeatedly regrowing and copying a 2 MiB buffer
     CURL* h = acquireHandle();
     FetchCtx fc{&out, len};
     struct curl_slist* hdrs = nullptr;

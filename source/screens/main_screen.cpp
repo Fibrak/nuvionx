@@ -19,15 +19,18 @@ public:
     }
 
     void update(float dt) override {
-        // Debug: ZL+ZR cycles  off -> overlay -> overlay+flat cards -> off.
+        // Debug: ZL+ZR cycles  off -> overlay -> overlay+flat cards -> playback trace -> off.
+        // The trace mode hides the overlay: redrawing its changing text would skew the timings.
         if ((input::held(input::ZL) && input::pressed(input::ZR)) ||
             (input::held(input::ZR) && input::pressed(input::ZL))) {
-            dbgMode_ = (dbgMode_ + 1) % 3;
+            dbgMode_ = (dbgMode_ + 1) % 4;
             auto& s = store::settings();
-            s.perfOverlay = dbgMode_ > 0;
+            s.perfOverlay = dbgMode_ == 1 || dbgMode_ == 2;
+            s.playbackTrace = dbgMode_ == 3;
             gfx::setDebugFlat(dbgMode_ == 2);
             store::saveSettings();
-            const char* msg[] = {"Debug OFF", "Overlay ON", "Overlay + FLAT cards (no rounded corners)"};
+            const char* msg[] = {"Debug OFF", "Overlay ON", "Overlay + FLAT cards (no rounded corners)",
+                                 "Playback trace ON: next videos save a CSV when closed"};
             App::get().toast(msg[dbgMode_]);
         }
         if (input::pressed(input::Plus)) {
@@ -46,6 +49,7 @@ public:
             }
             // keep animations alive without delivering input to the page
             pages_[tab_]->wantsTabBar = false;
+            pages_[tab_]->animate(dt);
             return;
         }
 
@@ -102,19 +106,24 @@ public:
         }
 
         float iBar = iAmt((int)names_.size() + 1);  // clock + battery come in last
-        time_t now = time(nullptr);
-        struct tm* lt = localtime(&now);
-        if (lt) {
-            char buf[16];
-            strftime(buf, sizeof buf, "%H:%M", lt);
-            text(buf, W - 48, 25, 18, fade(t.text2, iBar), true, Right);
+        // The clock only shows minutes: format it once a second, not every frame.
+        if (clockText_.empty() || gfx::now() - clockAt_ >= 1.0) {
+            clockAt_ = gfx::now();
+            clockText_.clear();
+            time_t wall = time(nullptr);
+            if (struct tm* lt = localtime(&wall)) {
+                char buf[16];
+                strftime(buf, sizeof buf, "%H:%M", lt);
+                clockText_ = buf;
+            }
         }
+        if (!clockText_.empty()) text(clockText_, W - 48, 25, 18, fade(t.text2, iBar), true, Right);
 
         // battery (to the left of the clock)
         bool charging = false;
         int batt = App::get().batteryPercent(&charging);
         if (batt >= 0) {
-            float clockW = lt ? textWidth("00:00", 18, true) : 0;
+            float clockW = !clockText_.empty() ? textWidth("00:00", 18, true) : 0;
             float right = W - 48 - clockW - 20;  // gap before the clock
             std::string pct = std::to_string(batt) + "%";
             float pctW = textWidth(pct, 18, true);
@@ -162,6 +171,8 @@ private:
     int dbgMode_ = 0;
     bool onTabs_ = false;
     double introStart_ = 0;  // top-bar intro animation start (set on first render)
+    std::string clockText_;
+    double clockAt_ = 0;
 };
 
 }  // namespace

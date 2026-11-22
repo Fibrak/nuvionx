@@ -2,6 +2,50 @@
 
 All notable changes to NuvioNX are documented here.
 
+## [0.1.6] - 2026-11-22
+
+Smoother 1080p playback from the first frame, much lighter menus, emoji in source lists, and a
+round of Home screen polish.
+
+### Added
+- **Emoji and styled text in source lists.** Bundles the open-licensed Noto Emoji font (single
+  colour, follows the text colour). Invisible emoji modifiers no longer show as boxes, flags
+  appear as country codes (`GB`), and decorative Unicode letters such as 𝗕𝗹𝘂𝗥𝗮𝘆 or ᴡᴇʙ-ᴅʟ are
+  shown as plain text.
+- **Playback trace (debug).** `ZL`+`ZR` on the main menu now also cycles to a per-frame trace that
+  saves a CSV to `sdmc:/switch/NuvioNX/traces/` when the player closes. It contains no titles or
+  stream URLs and is off after every app restart.
+- **Separate drop counters.** The player's Info panel now shows output and decoder drops
+  separately, and reports the real render path.
+
+### Changed
+- **Smooth playback start.** The player prepares its slow first frame while paused and then
+  starts, so that 300-550 ms stall no longer drops the opening frames.
+- **Periodic saves no longer stall playback.** The 5-minute progress save now runs on a background
+  thread instead of blocking the main thread on the SD card.
+- **Menus run smoother.** Menus in use are paced by vsync alone; an extra sleep could keep them
+  below 60 fps. Idle menus still throttle down to save power.
+- **Much less per-frame work.** Text measuring and wrapping, the source list, filter chips, the
+  Play/Resume label and the clock are cached, poster uploads have a per-frame time budget, and
+  image cache maintenance no longer runs every frame.
+- **Faster data handling.** Quicker JSON parsing, image downscaling, Continue Watching updates and
+  stream chunk buffering.
+- **Less video memory during playback.** Unused full-screen render targets are released.
+- **Home fade.** Rows now dissolve as they scroll up into the hero instead of being cut off.
+
+### Fixed
+- **Episode card flicker** while scrolling a season.
+- **Home scroll freezing midway** when jumping quickly to the tab bar. Search, Library, Addons and
+  Settings had the same bug.
+- **Hero title flash on launch.** The text title no longer appears briefly before the logo.
+- **Overlay CPU readout** always showing 0 ms.
+
+### Known limitations
+- The dedicated video render thread introduced in 0.1.5 does not start on current builds, so video
+  renders through the main-thread GPU path. 1080p plays smoothly this way.
+- 4K remains unsupported in practice: tested high-bitrate 4K exceeded both the download speed and
+  the per-frame render budget.
+
 ## [0.1.5] - 2026-11-21
 
 Playback is now spread across the Switch's CPU cores, pacing is vsync-locked and smooth, and

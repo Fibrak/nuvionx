@@ -140,7 +140,7 @@ public:
         }
 
         // buttons
-        std::string playLabel = playButtonLabel();
+        const std::string& playLabel = playButtonLabel();
         ui::button(playLabel, x, by, 48, zone_ == 0 && btn_ == 0, true);
         ui::tapToActivate(x, by, ui::buttonWidth(playLabel), 48, [this] {
             zone_ = 0;
@@ -206,6 +206,7 @@ private:
     }
 
     void computeSeasons(bool selectNextUp) {
+        playLabelRev_ = -1;  // the metadata may have changed
         seasons_.clear();
         for (auto& v : meta_.videos)
             if (std::find(seasons_.begin(), seasons_.end(), v.season) == seasons_.end()) seasons_.push_back(v.season);
@@ -255,7 +256,18 @@ private:
         }
     }
 
-    std::string playButtonLabel() {
+    // Finding the next episode scans the watch history and the episode list, so only redo it
+    // when progress or the metadata changed.
+    const std::string& playButtonLabel() {
+        int rev = store::progressRevision();
+        if (rev != playLabelRev_) {
+            playLabelRev_ = rev;
+            playLabel_ = computePlayLabel();
+        }
+        return playLabel_;
+    }
+
+    std::string computePlayLabel() {
         if (!seasons_.empty()) {
             double r;
             const stremio::Video* nu = nextUpVideo(meta_, &r);
@@ -365,8 +377,14 @@ private:
                 ep_ = ei;
             });
             SDL_Texture* th = image(v.thumbnail.empty() ? meta_.background : v.thumbnail, 480, 270);
-            if (th) drawCover(th, cx, cy, cw, ch, 10);
-            else roundRect(cx, cy, cw, ch, 10, t.card);
+            if (th) {
+                // Flat blit + solid corner cut-outs, as on the home cards: textured
+                // rounded geometry shimmers while scrolling on the Switch.
+                drawCover(th, cx, cy, cw, ch);
+                if (!debugFlat()) cornerCutouts(cx, cy, cw, ch, 10, t.bg);
+            } else {
+                roundRect(cx, cy, cw, ch, 10, t.card);
+            }
             const store::Progress* p = store::progress(v.id);
             if (p && p->watched()) {
                 roundRect(cx + cw - 82, cy + 8, 74, 24, 12, withA(t.bg, 210));
@@ -402,6 +420,8 @@ private:
     int ep_ = 0;
     float epScroll_ = 0;
     float dt_ = 1.f / 60.f;
+    std::string playLabel_;
+    int playLabelRev_ = -1;
     ui::Backdrop bd_;
 };
 

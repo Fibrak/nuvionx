@@ -24,6 +24,7 @@ static int g_listen = -1;
 static int g_port = 8080;
 static std::mutex g_mx;
 static std::vector<std::string> g_submitted;
+static std::atomic<bool> g_pending{false};  // set after new data is stored
 
 static const char* kPage =
     "<!doctype html><html><head><meta charset=utf-8>"
@@ -139,6 +140,7 @@ static void handle(int fd) {
             std::lock_guard<std::mutex> lk(g_mx);
             g_import = body;
             g_haveImport = true;
+            g_pending = true;
         }
         std::string reply = complete ? "OK - import received, check your Switch" : "ERROR - incomplete upload";
         sendAll(fd, std::string("HTTP/1.1 ") + (complete ? "200 OK" : "400 Bad Request") +
@@ -161,6 +163,7 @@ static void handle(int fd) {
                 g_traktSecret = ts;
                 g_haveTrakt = true;
             }
+            if (g_haveConfig || g_haveTrakt) g_pending = true;
             msg = (g_haveConfig || g_haveTrakt) ? "Saved! Go to the Account tab on your Switch."
                                                 : "Nothing saved: enter the Nuvio URL + key, or a Trakt Client ID.";
         }
@@ -179,6 +182,7 @@ static void handle(int fd) {
         {
             std::lock_guard<std::mutex> lk(g_mx);
             g_submitted.push_back(url);
+            g_pending = true;
         }
         msg = "Sent! Check your Switch.";
     }
@@ -232,6 +236,8 @@ void stop() {
 
 bool running() { return g_run.load(); }
 int port() { return g_port; }
+
+bool hasPending() { return g_pending.exchange(false); }
 
 bool takeTraktConfig(std::string& clientId, std::string& clientSecret) {
     std::lock_guard<std::mutex> lk(g_mx);

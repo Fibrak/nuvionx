@@ -59,10 +59,12 @@ double now() { return g_now.load(); }
 // Up to this many Switch system fonts: Standard (primary) + script/symbol fallbacks, so text
 // from sources using CJK, Korean or special symbols renders instead of "tofu" boxes. SDL_ttf
 // 2.x has no built-in fallback, so we pick a covering font per glyph and composite the runs.
-static const int kMaxFonts = 6;
+static const int kMaxFonts = 7;
 static void* g_fontData[kMaxFonts] = {nullptr};
 static size_t g_fontSize[kMaxFonts] = {0};
 static int g_fontCount = 0;
+static int g_emojiFont = -1;          // index of the bundled Noto Emoji font, if it loaded
+static void* g_emojiData = nullptr;   // owned (SDL_LoadFile); the system fonts are shared memory
 
 struct FontSet {
     TTF_Font* f[kMaxFonts] = {nullptr};
@@ -87,6 +89,15 @@ struct ElEntry {
 };
 static std::unordered_map<std::string, ElEntry> g_ellip;
 
+// Measured widths and wrapped lines. Both depend only on the text, font size and width, and
+// menus ask for the same ones every frame, so each is measured with SDL_ttf only once.
+struct WrapEntry {
+    std::vector<std::string> lines;
+    double lastUse = 0;
+};
+static std::unordered_map<std::string, WrapEntry> g_wrap;
+static std::unordered_map<std::string, float> g_widths;
+
 static int px(int size) { return std::max(6, (int)std::lround(size * S)); }
 
 static FontSet& fontSet(int size, bool bold) {
@@ -98,8 +109,12 @@ static FontSet& fontSet(int size, bool bold) {
     fs.n = g_fontCount;
     for (int i = 0; i < g_fontCount; i++) {
         SDL_RWops* rw = SDL_RWFromConstMem(g_fontData[i], (int)g_fontSize[i]);
-        fs.f[i] = rw ? TTF_OpenFontRW(rw, 1, p) : nullptr;
-        if (fs.f[i] && bold) TTF_SetFontStyle(fs.f[i], TTF_STYLE_BOLD);
+        // Emoji are drawn slightly smaller so they sit inside the text's line box, and never
+        // synthetically bolded (that turns their fine detail into blobs).
+        bool emoji = i == g_emojiFont;
+        int pt = emoji ? std::max(6, (int)std::lround(p * 0.9f)) : p;
+        fs.f[i] = rw ? TTF_OpenFontRW(rw, 1, pt) : nullptr;
+        if (fs.f[i] && bold && !emoji) TTF_SetFontStyle(fs.f[i], TTF_STYLE_BOLD);
     }
     auto res = g_fonts.emplace(key, fs);
     return res.first->second;
@@ -161,25 +176,94 @@ static std::vector<TextRun> segmentText(const std::string& s) {
     return runs;
 }
 
+// Invisible format characters and emoji modifiers. SDL_ttf has no emoji sequence support, so
+// left in they would each draw a "tofu" box.
+static bool isInvisibleMark(uint32_t cp) {
+    return (cp >= 0xFE00 && cp <= 0xFE0F) ||    // variation selectors
+           cp == 0x200B || cp == 0x200D ||      // zero-width space / joiner
+           cp == 0x200E || cp == 0x200F ||      // direction marks
+           (cp >= 0x202A && cp <= 0x202E) ||    // bidi embedding
+           (cp >= 0x2060 && cp <= 0x2069) ||    // word joiner, bidi isolates
+           cp == 0xFEFF || cp == 0x20E3 ||      // BOM, keycap
+           (cp >= 0x1F3FB && cp <= 0x1F3FF) ||  // skin tones
+           (cp >= 0xE0020 && cp <= 0xE007F);    // tag sequences (subdivision flags)
+}
+
+// Stylised "font" letters that addons use for labels, mapped to plain ASCII (0 = not one).
+static uint32_t styledToAscii(uint32_t cp) {
+    if (cp >= 0x1D400 && cp <= 0x1D6A3) {  // 13 alphabets of A-Z a-z (bold, italic, sans, ...)
+        uint32_t k = (cp - 0x1D400) % 52;
+        return k < 26 ? 'A' + k : 'a' + (k - 26);
+    }
+    if (cp >= 0x1D7CE && cp <= 0x1D7FF) return '0' + (cp - 0x1D7CE) % 10;  // styled digits
+    static const struct {
+        uint32_t cp;
+        char c;
+    } smallCaps[] = {{0x1D00, 'A'}, {0x0299, 'B'}, {0x1D04, 'C'}, {0x1D05, 'D'}, {0x1D07, 'E'}, {0xA730, 'F'},
+                     {0x0262, 'G'}, {0x029C, 'H'}, {0x026A, 'I'}, {0x1D0A, 'J'}, {0x1D0B, 'K'}, {0x029F, 'L'},
+                     {0x1D0D, 'M'}, {0x0274, 'N'}, {0x1D0F, 'O'}, {0x1D18, 'P'}, {0xA7AF, 'Q'}, {0x0280, 'R'},
+                     {0xA731, 'S'}, {0x1D1B, 'T'}, {0x1D1C, 'U'}, {0x1D20, 'V'}, {0x1D21, 'W'}, {0x028F, 'Y'},
+                     {0x1D22, 'Z'}};
+    for (auto& m : smallCaps)
+        if (m.cp == cp) {  // real IPA letters stay as they are when a font can draw them
+            TTF_Font* f = fontSet(20, false).f[glyphFontIndex(cp)];
+            return f && TTF_GlyphIsProvided32(f, cp) ? 0 : (uint32_t)m.c;
+        }
+    return 0;
+}
+
+// Text as it will be drawn: invisible marks removed, flags shown as their country code
+// (regional indicators GB -> "GB"), styled letters made plain. ASCII is returned untouched.
+static const std::string& displayText(const std::string& s, std::string& buf) {
+    bool ascii = true;
+    for (unsigned char c : s)
+        if (c >= 0x80) { ascii = false; break; }
+    if (ascii) return s;
+    buf.clear();
+    buf.reserve(s.size());
+    int flagLetters = 0;  // consecutive regional indicators so far
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t start = i;
+        uint32_t cp = utf8Next(s, i);
+        if (isInvisibleMark(cp)) continue;
+        if (cp >= 0x1F1E6 && cp <= 0x1F1FF) {
+            if (flagLetters > 0 && flagLetters % 2 == 0) buf += ' ';  // between adjacent flags
+            buf += (char)('A' + (cp - 0x1F1E6));
+            flagLetters++;
+            continue;
+        }
+        flagLetters = 0;
+        if (uint32_t plain = styledToAscii(cp)) buf += (char)plain;
+        else buf.append(s, start, i - start);  // verbatim, so malformed bytes aren't re-encoded
+    }
+    return buf;
+}
+
 // Render white text, using a fallback font per glyph and compositing the runs baseline-aligned.
-static SDL_Surface* renderText(const std::string& s, int size, bool bold) {
+static SDL_Surface* renderText(const std::string& s0, int size, bool bold) {
     FontSet& fs = fontSet(size, bold);
     if (!fs.f[0]) return nullptr;
+    std::string normalized;
+    const std::string& s = displayText(s0, normalized);
     const SDL_Color white{255, 255, 255, 255};
     std::vector<TextRun> runs = segmentText(s);
-    if (runs.size() <= 1) {  // fast path: one font covers the whole string
+    // fast path: one font covers the whole string (emoji still composite, to stay on the line)
+    if (runs.size() <= 1 && (runs.empty() || runs[0].font != g_emojiFont)) {
         TTF_Font* f = (!runs.empty() && fs.f[runs[0].font]) ? fs.f[runs[0].font] : fs.f[0];
         return TTF_RenderUTF8_Blended(f, s.c_str(), white);
     }
     std::vector<SDL_Surface*> parts;
-    int totalW = 0, maxAsc = 0, maxDesc = 0;
+    // The line box comes from the primary font, so a label doesn't shift when it gains an emoji.
+    int totalW = 0, maxAsc = TTF_FontAscent(fs.f[0]), maxDesc = -TTF_FontDescent(fs.f[0]);
     for (auto& r : runs) {
         TTF_Font* f = fs.f[r.font] ? fs.f[r.font] : fs.f[0];
         SDL_Surface* su = TTF_RenderUTF8_Blended(f, s.substr(r.start, r.len).c_str(), white);
         parts.push_back(su);
-        int asc = TTF_FontAscent(f), desc = -TTF_FontDescent(f);
-        maxAsc = std::max(maxAsc, asc);
-        maxDesc = std::max(maxDesc, desc);
+        if (r.font != g_emojiFont) {
+            maxAsc = std::max(maxAsc, TTF_FontAscent(f));
+            maxDesc = std::max(maxDesc, -TTF_FontDescent(f));
+        }
         if (su) totalW += su->w;
     }
     SDL_Surface* out =
@@ -191,7 +275,9 @@ static SDL_Surface* renderText(const std::string& s, int size, bool bold) {
             if (!su) continue;
             TTF_Font* f = fs.f[runs[k].font] ? fs.f[runs[k].font] : fs.f[0];
             SDL_SetSurfaceBlendMode(su, SDL_BLENDMODE_NONE);  // copy pixels (incl. alpha), don't blend
-            SDL_Rect dst{x, maxAsc - TTF_FontAscent(f), su->w, su->h};
+            int dy = runs[k].font == g_emojiFont ? (maxAsc + maxDesc - su->h) / 2  // centred on the line
+                                                 : maxAsc - TTF_FontAscent(f);
+            SDL_Rect dst{x, dy, su->w, su->h};
             SDL_BlitSurface(su, nullptr, out, &dst);
             x += su->w;
         }
@@ -217,10 +303,12 @@ float lineHeight(int size) {
     return f ? TTF_FontHeight(f) / S : size * 1.2f;
 }
 
-float textWidth(const std::string& s, int size, bool bold) {
-    if (s.empty()) return 0;
+static float measureText(const std::string& s0, int size, bool bold) {
+    if (s0.empty()) return 0;
     FontSet& fs = fontSet(size, bold);
     if (!fs.f[0]) return 0;
+    std::string normalized;
+    const std::string& s = displayText(s0, normalized);
     std::vector<TextRun> runs = segmentText(s);
     int total = 0, w = 0, h = 0;
     for (auto& r : runs) {
@@ -228,6 +316,20 @@ float textWidth(const std::string& s, int size, bool bold) {
         if (TTF_SizeUTF8(f, s.substr(r.start, r.len).c_str(), &w, &h) == 0) total += w;
     }
     return total / S;
+}
+
+float textWidth(const std::string& s, int size, bool bold) {
+    if (s.empty()) return 0;
+    static std::string key;  // main thread only; reused so a cache hit never allocates
+    key.assign(s);
+    key += '\x1f';
+    key += std::to_string(px(size));
+    key += bold ? 'b' : 'r';
+    auto it = g_widths.find(key);
+    if (it != g_widths.end()) return it->second;
+    float w = measureText(s, size, bold);
+    g_widths.emplace(key, w);
+    return w;
 }
 
 static size_t prevCodepoint(const std::string& s, size_t i) {
@@ -238,7 +340,7 @@ static size_t prevCodepoint(const std::string& s, size_t i) {
 }
 
 static std::string ellipsize(const std::string& s, int size, bool bold, float maxW) {
-    if (textWidth(s, size, bold) <= maxW) return s;
+    if (measureText(s, size, bold) <= maxW) return s;
     const std::string dots = "...";
     // binary search on byte length, snapped to codepoint starts
     size_t lo = 0, hi = s.size();
@@ -246,7 +348,7 @@ static std::string ellipsize(const std::string& s, int size, bool bold, float ma
         size_t mid = (lo + hi + 1) / 2;
         size_t cut = mid;
         while (cut > 0 && cut < s.size() && ((unsigned char)s[cut] & 0xC0) == 0x80) cut--;
-        if (textWidth(s.substr(0, cut) + dots, size, bold) <= maxW)
+        if (measureText(s.substr(0, cut) + dots, size, bold) <= maxW)
             lo = mid;
         else
             hi = mid - 1;
@@ -262,7 +364,8 @@ static std::string ellipsize(const std::string& s, int size, bool bold, float ma
 // those are stable frame-to-frame for menu labels, so we only pay the measuring
 // cost once per unique label instead of every frame.
 static const std::string& ellipsizeCached(const std::string& s, int size, bool bold, float maxW) {
-    std::string key = s;
+    static std::string key;
+    key.assign(s);
     key += '\x1f';
     key += std::to_string(px(size));
     key += bold ? 'b' : 'r';
@@ -279,7 +382,8 @@ static const std::string& ellipsizeCached(const std::string& s, int size, bool b
 }
 
 static TextEntry* textTex(const std::string& s, int size, bool bold) {
-    std::string key = s;
+    static std::string key;
+    key.assign(s);
     key += '\x1f';
     key += std::to_string(px(size));
     key += bold ? 'b' : 'r';
@@ -318,7 +422,7 @@ float text(const std::string& s0, float x, float y, int size, Col c, bool bold, 
     return w;
 }
 
-std::vector<std::string> wrap(const std::string& s, int size, float maxW, int maxLines, bool bold) {
+static std::vector<std::string> wrapText(const std::string& s, int size, float maxW, int maxLines, bool bold) {
     std::vector<std::string> lines;
     if (s.empty()) return lines;
     // tokenise into words, keeping explicit newlines
@@ -347,7 +451,7 @@ std::vector<std::string> wrap(const std::string& s, int size, float maxW, int ma
             i++;
         } else {
             std::string cand = line.empty() ? w : line + " " + w;
-            if (textWidth(cand, size, bold) <= maxW) {
+            if (measureText(cand, size, bold) <= maxW) {
                 line = cand;
                 i++;
             } else if (line.empty()) {
@@ -357,7 +461,7 @@ std::vector<std::string> wrap(const std::string& s, int size, float maxW, int ma
                 while (k < w.size()) {
                     size_t n = k + 1;
                     while (n < w.size() && ((unsigned char)w[n] & 0xC0) == 0x80) n++;
-                    if (textWidth(part + w.substr(k, n - k), size, bold) > maxW && !part.empty()) break;
+                    if (measureText(part + w.substr(k, n - k), size, bold) > maxW && !part.empty()) break;
                     part += w.substr(k, n - k);
                     k = n;
                 }
@@ -384,9 +488,33 @@ std::vector<std::string> wrap(const std::string& s, int size, float maxW, int ma
     return lines;
 }
 
+// The returned reference stays valid until endFrame() (the only place entries are removed).
+static const std::vector<std::string>& wrapCached(const std::string& s, int size, float maxW, int maxLines, bool bold) {
+    static std::string key;
+    key.assign(s);
+    key += '\x1f';
+    key += std::to_string(px(size));
+    key += bold ? 'b' : 'r';
+    key += std::to_string(maxLines);
+    key += '\x1f';
+    key.append(reinterpret_cast<const char*>(&maxW), sizeof maxW);
+    double t = now();
+    auto it = g_wrap.find(key);
+    if (it != g_wrap.end()) {
+        it->second.lastUse = t;
+        return it->second.lines;
+    }
+    auto res = g_wrap.emplace(key, WrapEntry{wrapText(s, size, maxW, maxLines, bold), t});
+    return res.first->second.lines;
+}
+
+std::vector<std::string> wrap(const std::string& s, int size, float maxW, int maxLines, bool bold) {
+    return wrapCached(s, size, maxW, maxLines, bold);
+}
+
 float paragraph(const std::string& s, float x, float y, float maxW, int size, Col c, int maxLines, float lineGap,
                 bool bold) {
-    auto lines = wrap(s, size, maxW, maxLines, bold);
+    const auto& lines = wrapCached(s, size, maxW, maxLines, bold);
     float lh = size * lineGap;
     for (size_t i = 0; i < lines.size(); i++) text(lines[i], x, y + i * lh, size, c, bold);
     return lines.size() * lh;
@@ -576,6 +704,7 @@ struct Img {
     int maxW = 0, maxH = 0;
     double lastUse = 0;
     double readyAt = 0;  // for fade-in
+    double lastBump = 0;  // last time this queued request was moved to the top of the stack
     size_t bytes = 0;
 };
 
@@ -635,13 +764,18 @@ static SDL_Surface* boxDownscale(SDL_Surface* src, int dw, int dh) {
     SDL_Surface* dst = SDL_CreateRGBSurfaceWithFormat(0, dw, dh, 32, SDL_PIXELFORMAT_RGBA32);
     if (!dst) return nullptr;
     const int sw = src->w, sh = src->h;
+    // Source column span of each output column, computed once instead of per pixel.
+    std::vector<int> xStart((size_t)dw), xEnd((size_t)dw);
+    for (int dx = 0; dx < dw; dx++) {
+        xStart[dx] = (int)((long long)dx * sw / dw);
+        xEnd[dx] = std::max(xStart[dx] + 1, (int)((long long)(dx + 1) * sw / dw));
+    }
     for (int dy = 0; dy < dh; dy++) {
         int y0 = (int)((long long)dy * sh / dh);
         int y1 = std::max(y0 + 1, (int)((long long)(dy + 1) * sh / dh));
         Uint8* drow = (Uint8*)dst->pixels + dy * dst->pitch;
         for (int dx = 0; dx < dw; dx++) {
-            int x0 = (int)((long long)dx * sw / dw);
-            int x1 = std::max(x0 + 1, (int)((long long)(dx + 1) * sw / dw));
+            const int x0 = xStart[dx], x1 = xEnd[dx];
             unsigned acc[4] = {0, 0, 0, 0};
             for (int y = y0; y < y1; y++) {
                 const Uint8* p = (const Uint8*)src->pixels + y * src->pitch + x0 * 4;
@@ -731,7 +865,8 @@ static void imageWorker() {
 
 static int g_uploadsThisFrame = 0;
 static int g_uploadsLastFrame = 0;
-static int g_missThisFrame = 0;   // cards that fell back to placeholder (image() returned null)
+static Uint64 g_uploadTicksThisFrame = 0;  // time spent uploading textures this frame
+static int g_missThisFrame = 0;  // cards that fell back to placeholder (image() returned null)
 static int g_missLastFrame = 0;
 static int g_evictTotal = 0;      // cumulative evictions (overlay shows the rate)
 
@@ -785,6 +920,7 @@ SDL_Texture* image(const std::string& url, int maxW, int maxH) {
         im.maxW = maxW;
         im.maxH = maxH;
         im.lastUse = now();
+        im.lastBump = im.lastUse;
         g_imgs.emplace(url, im);
         g_imgStack.push_back(url);
         if (g_imgStack.size() > 2000) {
@@ -800,17 +936,23 @@ SDL_Texture* image(const std::string& url, int maxW, int maxH) {
     }
     Img& im = it->second;
     im.lastUse = now();
-    if (im.st == Queued) {
-        // re-prioritise: move to top of the LIFO stack
+    if (im.st == Queued && im.lastUse - im.lastBump >= 0.25) {
+        // re-prioritise: move to top of the LIFO stack (a linear search, so not every frame)
+        im.lastBump = im.lastUse;
         auto pos = std::find(g_imgStack.begin(), g_imgStack.end(), url);
         if (pos != g_imgStack.end() && pos + 1 != g_imgStack.end()) {
             g_imgStack.erase(pos);
             g_imgStack.push_back(url);
         }
     }
-    if (im.st == Decoded && g_uploadsThisFrame < 8) {  // upload budget per frame (prefetch fills ahead)
+    // Upload budget per frame (prefetch fills ahead): at most 8 textures or about 4 ms, always
+    // allowing one, so a burst of finished posters can't cause a visible hitch while scrolling.
+    if (im.st == Decoded && g_uploadsThisFrame < 8 &&
+        (g_uploadsThisFrame == 0 || g_uploadTicksThisFrame < g_freq / 250)) {
         g_uploadsThisFrame++;
+        Uint64 uploadStart = SDL_GetPerformanceCounter();
         im.tex = SDL_CreateTextureFromSurface(R, im.surf);
+        g_uploadTicksThisFrame += SDL_GetPerformanceCounter() - uploadStart;
         SDL_FreeSurface(im.surf);
         im.surf = nullptr;
         if (im.tex) {
@@ -901,6 +1043,14 @@ void drawFit(SDL_Texture* t, float x, float y, float w, float h, Uint8 alpha, Al
 }
 
 static void gcImages() {
+    // Walking the whole cache under the lock every frame would stall the image workers, so
+    // check twice a second, or sooner if a lot of new textures arrived.
+    static double lastCheck = 0;
+    static int uploadsSinceCheck = 0;
+    uploadsSinceCheck += g_uploadsThisFrame;
+    if (uploadsSinceCheck < 16 && now() - lastCheck < 0.5) return;
+    lastCheck = now();
+    uploadsSinceCheck = 0;
     std::lock_guard<std::mutex> lk(g_imgMutex);
     size_t ready = 0, bytes = 0;
     for (auto& kv : g_imgs)
@@ -929,12 +1079,22 @@ static void gcImages() {
 
 static void gcText() {
     double t = now();
+    static double lastCheck = 0;
+    if (t - lastCheck < 0.5) return;
+    lastCheck = t;
     if (g_ellip.size() >= 800) {
         for (auto it = g_ellip.begin(); it != g_ellip.end();) {
             if (t - it->second.lastUse > 3.0) it = g_ellip.erase(it);
             else ++it;
         }
     }
+    if (g_wrap.size() >= 500) {
+        for (auto it = g_wrap.begin(); it != g_wrap.end();) {
+            if (t - it->second.lastUse > 3.0) it = g_wrap.erase(it);
+            else ++it;
+        }
+    }
+    if (g_widths.size() >= 3000) g_widths.clear();  // cheap to rebuild on demand
     if (g_text.size() < 600) return;
     for (auto it = g_text.begin(); it != g_text.end();) {
         if (t - it->second.lastUse > 3.0) {
@@ -970,6 +1130,16 @@ bool init(SDL_Renderer* r, int pixelW, int pixelH) {
     };
     addFont(PlSharedFontType_Standard);  // Latin, Cyrillic, Greek, Japanese, common symbols
     addFont(PlSharedFontType_NintendoExt);          // extra symbols / pictographs
+    if (g_fontCount > 0 && g_fontCount < kMaxFonts) {  // bundled emoji (optional: text still works without)
+        size_t emojiSize = 0;
+        g_emojiData = SDL_LoadFile("romfs:/fonts/NotoEmoji.ttf", &emojiSize);
+        if (g_emojiData) {
+            g_emojiFont = g_fontCount;
+            g_fontData[g_fontCount] = g_emojiData;
+            g_fontSize[g_fontCount] = emojiSize;
+            g_fontCount++;
+        }
+    }
     addFont(PlSharedFontType_ChineseSimplified);
     addFont(PlSharedFontType_ExtChineseSimplified);
     addFont(PlSharedFontType_ChineseTraditional);
@@ -1001,6 +1171,8 @@ void shutdown() {
         for (int i = 0; i < kv.second.n; i++)
             if (kv.second.f[i]) TTF_CloseFont(kv.second.f[i]);
     g_fonts.clear();
+    SDL_free(g_emojiData);  // only after every TTF_Font reading from it is closed
+    g_emojiData = nullptr;
     IMG_Quit();
     TTF_Quit();
 }
@@ -1009,6 +1181,7 @@ void beginFrame() {
     g_now = (double)(SDL_GetPerformanceCounter() - g_start) / (double)g_freq;
     g_uploadsLastFrame = g_uploadsThisFrame;
     g_uploadsThisFrame = 0;
+    g_uploadTicksThisFrame = 0;
     g_missLastFrame = g_missThisFrame;
     g_missThisFrame = 0;
     const Theme& t = theme();

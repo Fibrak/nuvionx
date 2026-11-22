@@ -115,6 +115,15 @@ Value& Value::set(const std::string& key, Value v) {
     return arr_.back();
 }
 
+Value& Value::append(const std::string& key, Value v) {
+    if (t_ != Type::Object) {
+        *this = object();
+    }
+    keys_.push_back(key);
+    arr_.push_back(std::move(v));
+    return arr_.back();
+}
+
 Value& Value::push(Value v) {
     if (t_ != Type::Array) {
         *this = array();
@@ -244,12 +253,13 @@ private:
         if (p_ >= e_ || *p_ != '"') return false;
         p_++;
         while (p_ < e_) {
+            // copy the run up to the next quote or escape in one go
+            const char* run = p_;
+            while (p_ < e_ && *p_ != '"' && *p_ != '\\') p_++;
+            if (p_ > run) out.append(run, (size_t)(p_ - run));
+            if (p_ >= e_) return false;
             char c = *p_++;
             if (c == '"') return true;
-            if (c != '\\') {
-                out += c;
-                continue;
-            }
             if (p_ >= e_) return false;
             char esc = *p_++;
             switch (esc) {

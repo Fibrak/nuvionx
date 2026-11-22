@@ -190,7 +190,7 @@ See `ARCHITECTURE.md` for how the pieces fit together and the non-obvious Switch
   still scaled on the CPU.
 - **Sync pulls down only** — watching on the Switch doesn't push back to a Nuvio account (Trakt
   scrobbling does push).
-- **System font only** — no CJK glyphs.
+- **Emoji are single-colour**, and flags are shown as country codes.
 - Nuvio's and Trakt's API keys are **not** bundled; you enter your own (see the Account tab).
 
 ---
@@ -202,5 +202,7 @@ See `ARCHITECTURE.md` for how the pieces fit together and the non-obvious Switch
 - Built with [devkitPro](https://devkitpro.org/), [libnx](https://github.com/switchbrew/libnx),
   SDL2, [mpv](https://mpv.io/) / FFmpeg, and [libcurl](https://curl.se/).
 - QR codes: [QR-Code-generator](https://github.com/nayuki/QR-Code-generator) by Project Nayuki (MIT).
+- Emoji: [Noto Emoji](https://github.com/googlefonts/noto-emoji) by Google (SIL OFL 1.1, see
+  `romfs/fonts/NotoEmoji-OFL.txt`).
 - The Nuvio name and logo belong to the Nuvio project; this is an unofficial fan port. If you
   redistribute builds, keep them clearly labelled as unofficial.

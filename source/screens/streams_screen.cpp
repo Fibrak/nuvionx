@@ -51,11 +51,11 @@ public:
             App::get().pop();
             return;
         }
-        auto chips = filterChips();
+        const auto& chips = filterChips();
         if (input::pressed(input::L) && filter_ > 0) setFilter(filter_ - 1);
         if (input::pressed(input::R) && filter_ + 1 < (int)chips.size()) setFilter(filter_ + 1);
 
-        auto list = visibleList();
+        const auto& list = visibleList();
         if (!list.empty()) {
             if (input::pressed(input::Up)) sel_ = std::max(0, sel_ - 1);
             if (input::pressed(input::Down)) sel_ = std::min((int)list.size() - 1, sel_ + 1);
@@ -103,7 +103,7 @@ public:
         }
 
         // filter chips
-        auto chips = filterChips();
+        const auto& chips = filterChips();
         float cx = 440;
         for (size_t i = 0; i < chips.size(); i++) {
             float cw0 = ui::chip(chips[i], cx, 84, false, (int)i == filter_, 15);
@@ -114,7 +114,7 @@ public:
         }
 
         // list
-        auto list = visibleList();
+        const auto& list = visibleList();
         float top = 136, bottom = 664;
         if (list.empty()) {
             if (pending_ > 0) {
@@ -168,11 +168,15 @@ private:
 
     const stremio::Stream& stream(Ref r) const { return groups_[r.g].streams[r.s]; }
 
-    std::vector<std::string> filterChips() const {
-        std::vector<std::string> out{"All"};
-        for (auto& g : groups_)
-            if (!g.streams.empty()) out.push_back(g.name);
-        return out;
+    // Rebuilt only when results arrive; this used to run twice per frame.
+    const std::vector<std::string>& filterChips() {
+        if (chipsRev_ != groupsRev_) {
+            chipsRev_ = groupsRev_;
+            chips_.assign(1, "All");
+            for (auto& g : groups_)
+                if (!g.streams.empty()) chips_.push_back(g.name);
+        }
+        return chips_;
     }
 
     void setFilter(int f) {
@@ -181,10 +185,22 @@ private:
         scroll_ = 0;
     }
 
-    std::vector<Ref> visibleList() const {
-        std::vector<Ref> out;
+    // Filtering and sorting hundreds of streams is only redone when an input to it changes
+    // (new results, the filter chip, or settings/keys updated by an account sync).
+    const std::vector<Ref>& visibleList() {
         const store::Settings& st = store::settings();
         bool showUnsupported = st.showUnsupported;
+        bool debridOn = debrid::available(st);
+        if (listRev_ == groupsRev_ && listFilter_ == filter_ && listHide4k_ == st.hide4k &&
+            listShowUnsupported_ == showUnsupported && listDebrid_ == debridOn)
+            return list_;
+        listRev_ = groupsRev_;
+        listFilter_ = filter_;
+        listHide4k_ = st.hide4k;
+        listShowUnsupported_ = showUnsupported;
+        listDebrid_ = debridOn;
+        std::vector<Ref>& out = list_;
+        out.clear();
         int chipIdx = 0;
         for (size_t g = 0; g < groups_.size(); g++) {
             if (groups_[g].streams.empty()) continue;
@@ -233,6 +249,7 @@ private:
         for (auto& a : App::get().enabledAddons()) {
             if (!a.loaded || !a.supports("stream", ctx_.type, ctx_.videoId)) continue;
             groups_.push_back({a.name, {}});
+            groupsRev_++;
             int gi = (int)groups_.size() - 1;
             pending_++;
             std::string type = ctx_.type, vid = ctx_.videoId;
@@ -240,6 +257,7 @@ private:
                   [this, gi](std::vector<stremio::Stream>& res) {
                       pending_--;
                       groups_[gi].streams = res;
+                      groupsRev_++;
                       tryAutoPlay();
                   });
         }
@@ -318,6 +336,12 @@ private:
 
     PlayContext ctx_;
     std::vector<Group> groups_;
+    int groupsRev_ = 0;  // bumped whenever groups_ changes
+    std::vector<std::string> chips_;
+    int chipsRev_ = -1;
+    std::vector<Ref> list_;
+    int listRev_ = -1, listFilter_ = -1;
+    bool listHide4k_ = false, listShowUnsupported_ = false, listDebrid_ = false;
     int pending_ = 0;
     int filter_ = 0, sel_ = 0;
     float scroll_ = 0, dt_ = 1.f / 60.f;

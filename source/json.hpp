@@ -51,6 +51,8 @@ public:
     std::vector<std::string> strings() const;
 
     Value& set(const std::string& key, Value v);  // turns null into object
+    // Like set() for a key known to be new: skips the linear duplicate search.
+    Value& append(const std::string& key, Value v);
     Value& push(Value v);                          // turns null into array
 
     std::string dump() const;

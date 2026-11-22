@@ -10,6 +10,8 @@ bool start(int port = 8080);
 void stop();
 bool running();
 int port();
+// True once after anything new was submitted, so the main loop can skip the take*() calls.
+bool hasPending();
 // URLs submitted through the web form since the last call (main thread).
 std::vector<std::string> takeSubmitted();
 // Account server details submitted via /account (main thread). Returns false if none pending.
